@@ -136,13 +136,10 @@ fn run(
 }
 
 fn build_pipeline(request: &Request) -> Result<gst::Pipeline, String> {
-    let location = gst::glib::shell_quote(request.destination.as_os_str())
-        .to_string_lossy()
-        .into_owned();
     // Every branch stays compressed. Matroska handles the common ONVIF RTSP
     // combinations below, including AAC, Opus and G.711 audio when present.
     let description = format!(
-        "matroskamux name=mux ! filesink location={location} \
+        "matroskamux name=mux ! filesink name=sink \
          rtspsrc name=source latency={RTSP_LATENCY_MS} drop-on-latency=true protocols=tcp \
          source. ! application/x-rtp,media=video,encoding-name=H264 ! rtph264depay ! h264parse config-interval=-1 ! mux. \
          source. ! application/x-rtp,media=video,encoding-name=H265 ! rtph265depay ! h265parse config-interval=-1 ! mux. \
@@ -164,6 +161,11 @@ fn build_pipeline(request: &Request) -> Result<gst::Pipeline, String> {
     source.set_property("location", &request.uri);
     source.set_property("user-id", &request.username);
     source.set_property("user-pw", &request.password);
+    let destination = request.destination.to_string_lossy();
+    let sink = pipeline
+        .by_name("sink")
+        .ok_or_else(|| "Could not configure the recording destination.".to_owned())?;
+    sink.set_property("location", destination.as_ref());
     Ok(pipeline)
 }
 
