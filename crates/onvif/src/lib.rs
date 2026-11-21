@@ -9,12 +9,13 @@ use rand::{RngCore, rngs::OsRng};
 use reqwest::{Client, redirect::Policy};
 use roxmltree::{Document, Node};
 use sha1::{Digest, Sha1};
-use std::{fmt, time::Duration};
+use std::{collections::HashMap, fmt, sync::Mutex, time::Duration};
 use url::Url;
 
 const DEVICE: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA: &str = "http://www.onvif.org/ver10/media/wsdl";
 const MEDIA2: &str = "http://www.onvif.org/ver20/media/wsdl";
+const PTZ: &str = "http://www.onvif.org/ver20/ptz/wsdl";
 const SOAP: &str = "http://www.w3.org/2003/05/soap-envelope";
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
 
@@ -55,6 +56,9 @@ pub struct Camera {
     client: Client,
     media_url: Url,
     media_namespace: &'static str,
+    ptz_url: Option<Url>,
+    ptz_configurations: HashMap<String, String>,
+    ptz_options: Mutex<HashMap<String, Option<PtzOptions>>>,
     username: String,
     password: String,
 }
@@ -92,6 +96,7 @@ pub async fn connect(address: &str, username: &str, password: &str) -> Result<Ca
     )
     .await?;
     let (media_url, media_namespace) = parse_services(&services_xml, &device_url)?;
+    let ptz_url = parse_ptz_service(&services_xml, &device_url)?;
     let (prefix, namespace) = if media_namespace == MEDIA {
         ("trt", MEDIA)
     } else {
@@ -109,6 +114,7 @@ pub async fn connect(address: &str, username: &str, password: &str) -> Result<Ca
     )
     .await?;
     let profiles = parse_profiles(&profiles_xml, namespace)?;
+    let ptz_configurations = parse_ptz_configurations(&profiles_xml, namespace)?;
 
     Ok(Camera {
         information,
@@ -116,12 +122,120 @@ pub async fn connect(address: &str, username: &str, password: &str) -> Result<Ca
         client,
         media_url,
         media_namespace,
+        ptz_url,
+        ptz_configurations,
+        ptz_options: Mutex::new(HashMap::new()),
         username: username.to_owned(),
         password: password.to_owned(),
     })
 }
 
 impl Camera {
+    /// Discover continuous pan/tilt support for this media profile.
+    pub async fn ptz_supported(&self, profile_token: &str) -> Result<bool, Error> {
+        Ok(self.ptz_options(profile_token).await?.is_some())
+    }
+
+    /// Move continuously at normalized pan and tilt velocities in the range -1 to 1.
+    /// The movement expires automatically unless renewed.
+    pub async fn ptz_move(&self, profile_token: &str, x: f32, y: f32) -> Result<(), Error> {
+        if !x.is_finite()
+            || !y.is_finite()
+            || !(-1.0..=1.0).contains(&x)
+            || !(-1.0..=1.0).contains(&y)
+        {
+            return Err(error("PTZ velocity must be between -1 and 1"));
+        }
+        let options = self
+            .ptz_options(profile_token)
+            .await?
+            .ok_or_else(|| error("Continuous pan and tilt are not supported for this profile"))?;
+        let url = self
+            .ptz_url
+            .as_ref()
+            .ok_or_else(|| error("Camera has no PTZ service"))?;
+        let token = escape(profile_token);
+        let space = escape(&options.space);
+        let x = options.x.scale(x);
+        let y = options.y.scale(y);
+        let timeout = options.timeout;
+        let body = format!(
+            r#"<tptz:ContinuousMove xmlns:tptz="{PTZ}"><tptz:ProfileToken>{token}</tptz:ProfileToken><tptz:Velocity><tt:PanTilt x="{x}" y="{y}" space="{space}"/></tptz:Velocity><tptz:Timeout>PT{timeout}S</tptz:Timeout></tptz:ContinuousMove>"#
+        );
+        let xml = request(
+            &self.client,
+            url,
+            PTZ,
+            "ContinuousMove",
+            &body,
+            &self.username,
+            &self.password,
+        )
+        .await?;
+        let doc = parse_document(&xml)?;
+        response_node(&doc, PTZ, "ContinuousMoveResponse")?;
+        Ok(())
+    }
+
+    /// Stop pan and tilt without affecting zoom.
+    pub async fn ptz_stop(&self, profile_token: &str) -> Result<(), Error> {
+        let url = self
+            .ptz_url
+            .as_ref()
+            .ok_or_else(|| error("Camera has no PTZ service"))?;
+        if !self.ptz_configurations.contains_key(profile_token) {
+            return Err(error("Profile has no PTZ configuration"));
+        }
+        let token = escape(profile_token);
+        let body = format!(
+            r#"<tptz:Stop xmlns:tptz="{PTZ}"><tptz:ProfileToken>{token}</tptz:ProfileToken><tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>false</tptz:Zoom></tptz:Stop>"#
+        );
+        let xml = request(
+            &self.client,
+            url,
+            PTZ,
+            "Stop",
+            &body,
+            &self.username,
+            &self.password,
+        )
+        .await?;
+        let doc = parse_document(&xml)?;
+        response_node(&doc, PTZ, "StopResponse")?;
+        Ok(())
+    }
+
+    async fn ptz_options(&self, profile_token: &str) -> Result<Option<PtzOptions>, Error> {
+        let (Some(url), Some(configuration)) =
+            (&self.ptz_url, self.ptz_configurations.get(profile_token))
+        else {
+            return Ok(None);
+        };
+        if let Some(options) = self.ptz_options.lock().unwrap().get(profile_token).cloned() {
+            return Ok(options);
+        }
+        let configuration = escape(configuration);
+        let body = format!(
+            r#"<tptz:GetConfigurationOptions xmlns:tptz="{PTZ}"><tptz:ConfigurationToken>{configuration}</tptz:ConfigurationToken></tptz:GetConfigurationOptions>"#
+        );
+        let xml = request(
+            &self.client,
+            url,
+            PTZ,
+            "GetConfigurationOptions",
+            &body,
+            &self.username,
+            &self.password,
+        )
+        .await?;
+        let options = parse_ptz_options(&xml)?;
+        self.ptz_options
+            .lock()
+            .unwrap()
+            .insert(profile_token.to_owned(), options.clone());
+        Ok(options)
+    }
+
     /// Request an RTSP URI for a profile. The returned URI may contain credentials;
     /// callers must not log it or persist it.
     pub async fn stream_uri(&self, profile_token: &str) -> Result<String, Error> {
@@ -364,6 +478,156 @@ fn parse_services(xml: &str, base: &Url) -> Result<(Url, &'static str), Error> {
     media2.ok_or_else(|| error("Camera did not advertise a usable ONVIF media service"))
 }
 
+#[derive(Clone)]
+struct PtzOptions {
+    space: String,
+    x: VelocityRange,
+    y: VelocityRange,
+    timeout: f64,
+}
+
+#[derive(Clone, Copy)]
+struct VelocityRange {
+    min: f32,
+    max: f32,
+}
+
+impl VelocityRange {
+    fn scale(self, value: f32) -> f32 {
+        if value < 0.0 {
+            -value * self.min
+        } else {
+            value * self.max
+        }
+    }
+}
+
+fn parse_ptz_service(xml: &str, base: &Url) -> Result<Option<Url>, Error> {
+    let doc = parse_document(xml)?;
+    let response = response_node(&doc, DEVICE, "GetServicesResponse")?;
+    for service in response
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "Service")
+    {
+        if descendant_text(service, "Namespace").as_deref() != Some(PTZ) {
+            continue;
+        }
+        if let Some(url) = descendant_text(service, "XAddr")
+            .and_then(|address| base.join(&address).ok())
+            .filter(|url| validate_service_url(url).is_ok())
+        {
+            return Ok(Some(url));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_ptz_configurations(xml: &str, namespace: &str) -> Result<HashMap<String, String>, Error> {
+    let doc = parse_document(xml)?;
+    let response = response_node(&doc, namespace, "GetProfilesResponse")?;
+    let mut configurations = HashMap::new();
+    for profile in response
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "Profiles")
+    {
+        if let Some((profile_token, configuration_token)) =
+            profile.attribute("token").and_then(|token| {
+                profile
+                    .descendants()
+                    .find(|n| {
+                        n.is_element() && matches!(n.tag_name().name(), "PTZConfiguration" | "PTZ")
+                    })
+                    .and_then(|n| n.attribute("token"))
+                    .filter(|s| !s.is_empty())
+                    .map(|configuration| (token, configuration))
+            })
+        {
+            configurations.insert(profile_token.to_owned(), configuration_token.to_owned());
+        }
+    }
+    Ok(configurations)
+}
+
+// XML Schema durations with day/time components, expressed as seconds.
+fn duration_seconds(value: &str) -> Option<f64> {
+    let value = value.strip_prefix('P')?;
+    let mut rest = value;
+    let mut total = 0.0;
+    let mut found = false;
+    if let Some((days, after)) = rest.split_once('D') {
+        total += days.parse::<u64>().ok()? as f64 * 86400.0;
+        rest = after;
+        found = true;
+    }
+    if !rest.is_empty() {
+        rest = rest.strip_prefix('T')?;
+        if rest.is_empty() {
+            return None;
+        }
+        for (suffix, multiplier) in [('H', 3600.0), ('M', 60.0), ('S', 1.0)] {
+            if let Some((number, after)) = rest.split_once(suffix) {
+                let number = number.parse::<f64>().ok()?;
+                if !number.is_finite() || number < 0.0 {
+                    return None;
+                }
+                total += number * multiplier;
+                rest = after;
+                found = true;
+            }
+        }
+    }
+    (found && rest.is_empty() && total.is_finite()).then_some(total)
+}
+
+fn parse_ptz_options(xml: &str) -> Result<Option<PtzOptions>, Error> {
+    let doc = parse_document(xml)?;
+    let response = response_node(&doc, PTZ, "GetConfigurationOptionsResponse")?;
+    let Some(timeout) = response
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "PTZTimeout")
+    else {
+        return Ok(None);
+    };
+    let min = descendant_text(timeout, "Min").and_then(|s| duration_seconds(&s));
+    let max = descendant_text(timeout, "Max").and_then(|s| duration_seconds(&s));
+    let (Some(min), Some(max)) = (min, max) else {
+        return Ok(None);
+    };
+    // The UI renews at roughly one second. Require a margin and cap how long
+    // a lost connection can leave the camera moving.
+    if min > max || min > 5.0 || max < 2.0 {
+        return Ok(None);
+    }
+    let timeout = min.max(2.0);
+    let range = |node: Node<'_, '_>, name| -> Option<VelocityRange> {
+        let node = node
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == name)?;
+        let min: f32 = descendant_text(node, "Min")?.parse().ok()?;
+        let max: f32 = descendant_text(node, "Max")?.parse().ok()?;
+        (min.is_finite() && max.is_finite() && min < 0.0 && max > 0.0)
+            .then_some(VelocityRange { min, max })
+    };
+    for space in response
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "ContinuousPanTiltVelocitySpace")
+    {
+        if let (Some(uri), Some(x), Some(y)) = (
+            descendant_text(space, "URI"),
+            range(space, "XRange"),
+            range(space, "YRange"),
+        ) {
+            return Ok(Some(PtzOptions {
+                space: uri,
+                x,
+                y,
+                timeout,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn parse_profiles(xml: &str, namespace: &str) -> Result<Vec<Profile>, Error> {
     let doc = parse_document(xml)?;
     let response = response_node(&doc, namespace, "GetProfilesResponse")?;
@@ -422,8 +686,86 @@ mod tests {
 
     fn soap(body: &str) -> String {
         format!(
-            "<s:Envelope xmlns:s='{SOAP}' xmlns:d='{DEVICE}' xmlns:m='{MEDIA}' xmlns:t='http://www.onvif.org/ver10/schema'><s:Body>{body}</s:Body></s:Envelope>"
+            "<s:Envelope xmlns:s='{SOAP}' xmlns:d='{DEVICE}' xmlns:m='{MEDIA}' xmlns:p='{PTZ}' xmlns:t='http://www.onvif.org/ver10/schema'><s:Body>{body}</s:Body></s:Envelope>"
         )
+    }
+
+    fn options_xml(min: &str, max: &str, space: &str) -> String {
+        soap(&format!(
+            "<p:GetConfigurationOptionsResponse><p:PTZConfigurationOptions><t:Spaces>{space}</t:Spaces><t:PTZTimeout><t:Min>{min}</t:Min><t:Max>{max}</t:Max></t:PTZTimeout></p:PTZConfigurationOptions></p:GetConfigurationOptionsResponse>"
+        ))
+    }
+
+    const PAN_TILT_SPACE: &str = "<t:ContinuousPanTiltVelocitySpace><t:URI>urn:space&amp;1</t:URI><t:XRange><t:Min>-0.5</t:Min><t:Max>1</t:Max></t:XRange><t:YRange><t:Min>-1</t:Min><t:Max>0.5</t:Max></t:YRange></t:ContinuousPanTiltVelocitySpace>";
+
+    #[test]
+    fn ptz_discovery_is_profile_specific_and_optional() {
+        let base = Url::parse("http://camera/onvif/device").unwrap();
+        let services = soap(&format!(
+            "<d:GetServicesResponse><d:Service><d:Namespace>{PTZ}</d:Namespace><d:XAddr>/ptz</d:XAddr></d:Service></d:GetServicesResponse>"
+        ));
+        assert_eq!(
+            parse_ptz_service(&services, &base)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "http://camera/ptz"
+        );
+        let absent = soap("<d:GetServicesResponse/>");
+        assert!(parse_ptz_service(&absent, &base).unwrap().is_none());
+        let unsafe_url = soap(&format!(
+            "<d:GetServicesResponse><d:Service><d:Namespace>{PTZ}</d:Namespace><d:XAddr>http://user:pass@camera/</d:XAddr></d:Service></d:GetServicesResponse>"
+        ));
+        assert!(parse_ptz_service(&unsafe_url, &base).unwrap().is_none());
+        let profiles = soap(
+            "<m:GetProfilesResponse><m:Profiles token='a'><t:PTZConfiguration token='config&amp;1'/></m:Profiles><m:Profiles token='b'/></m:GetProfilesResponse>",
+        );
+        let configs = parse_ptz_configurations(&profiles, MEDIA).unwrap();
+        assert_eq!(configs.get("a").map(String::as_str), Some("config&1"));
+        assert!(!configs.contains_key("b"));
+        let media2 = format!(
+            "<s:Envelope xmlns:s='{SOAP}' xmlns:m='{MEDIA2}'><s:Body><m:GetProfilesResponse><m:Profiles token='a'><m:Configurations><m:PTZ token='c'/></m:Configurations></m:Profiles></m:GetProfilesResponse></s:Body></s:Envelope>"
+        );
+        assert_eq!(
+            parse_ptz_configurations(&media2, MEDIA2)
+                .unwrap()
+                .get("a")
+                .map(String::as_str),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn ptz_options_require_safe_timeout_and_bidirectional_space() {
+        let options = parse_ptz_options(&options_xml("PT1S", "PT60S", PAN_TILT_SPACE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.timeout, 2.0);
+        assert_eq!(options.space, "urn:space&1");
+        assert_eq!(options.x.scale(-1.0), -0.5);
+        assert_eq!(options.y.scale(1.0), 0.5);
+        assert_eq!(
+            parse_ptz_options(&options_xml("PT3S", "PT1M", PAN_TILT_SPACE))
+                .unwrap()
+                .unwrap()
+                .timeout,
+            3.0
+        );
+        for (min, max, space) in [
+            ("PT6S", "PT60S", PAN_TILT_SPACE),
+            ("PT0S", "PT1S", PAN_TILT_SPACE),
+            ("PT3S", "PT2S", PAN_TILT_SPACE),
+            ("invalid", "PT60S", PAN_TILT_SPACE),
+            ("PT1S", "PT60S", ""),
+        ] {
+            assert!(
+                parse_ptz_options(&options_xml(min, max, space))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(duration_seconds("P1DT1H2M3.5S"), Some(90123.5));
+        assert_eq!(duration_seconds("PTNaNS"), None);
     }
 
     #[test]
@@ -537,20 +879,26 @@ mod tests {
                     "<d:GetDeviceInformationResponse><d:Manufacturer>Maker</d:Manufacturer><d:Model>Model</d:Model><d:FirmwareVersion>1</d:FirmwareVersion><d:SerialNumber>123</d:SerialNumber></d:GetDeviceInformationResponse>",
                 ),
                 soap(&format!(
-                    "<d:GetServicesResponse><d:Service><d:Namespace>{MEDIA}</d:Namespace><d:XAddr>/media</d:XAddr></d:Service></d:GetServicesResponse>"
+                    "<d:GetServicesResponse><d:Service><d:Namespace>{MEDIA}</d:Namespace><d:XAddr>/media</d:XAddr></d:Service><d:Service><d:Namespace>{PTZ}</d:Namespace><d:XAddr>/ptz</d:XAddr></d:Service></d:GetServicesResponse>"
                 )),
                 soap(
-                    "<m:GetProfilesResponse><m:Profiles token='one&amp;two'><t:Name>Main</t:Name></m:Profiles></m:GetProfilesResponse>",
+                    "<m:GetProfilesResponse><m:Profiles token='one&amp;two'><t:Name>Main</t:Name><t:PTZConfiguration token='config&amp;1'/></m:Profiles><m:Profiles token='fixed'><t:Name>Fixed</t:Name></m:Profiles></m:GetProfilesResponse>",
                 ),
                 soap(
                     "<m:GetStreamUriResponse><m:MediaUri><t:Uri>rtsp://camera/live</t:Uri></m:MediaUri></m:GetStreamUriResponse>",
                 ),
+                options_xml("PT1S", "PT60S", PAN_TILT_SPACE),
+                soap("<p:ContinuousMoveResponse/>"),
+                soap("<p:StopResponse/>"),
             ];
             let operations = [
                 "GetDeviceInformation",
                 "GetServices",
                 "GetProfiles",
                 "GetStreamUri",
+                "GetConfigurationOptions",
+                "ContinuousMove",
+                "Stop",
             ];
             let mut nonces = Vec::new();
             for (operation, reply) in operations.into_iter().zip(replies) {
@@ -588,6 +936,20 @@ mod tests {
                 if operation == "GetStreamUri" {
                     assert!(body.contains("one&amp;two"));
                 }
+                if operation == "GetConfigurationOptions" {
+                    assert!(body.contains("config&amp;1"));
+                }
+                if operation == "ContinuousMove" {
+                    assert!(body.contains("one&amp;two"));
+                    assert!(body.contains("urn:space&amp;1"));
+                    assert!(body.contains("x=\"-0.5\""));
+                    assert!(body.contains("y=\"0.5\""));
+                    assert!(body.contains("PT2S"));
+                }
+                if operation == "Stop" {
+                    assert!(body.contains("<tptz:PanTilt>true</tptz:PanTilt>"));
+                    assert!(body.contains("<tptz:Zoom>false</tptz:Zoom>"));
+                }
                 let doc = Document::parse(body).unwrap();
                 let nonce = doc
                     .descendants()
@@ -610,6 +972,11 @@ mod tests {
             camera.stream_uri(&camera.profiles[0].token).await.unwrap(),
             "rtsp://camera/live"
         );
+        assert!(!camera.ptz_supported("fixed").await.unwrap());
+        assert!(camera.ptz_supported("one&two").await.unwrap());
+        assert!(camera.ptz_move("one&two", f32::NAN, 0.0).await.is_err());
+        camera.ptz_move("one&two", -1.0, 1.0).await.unwrap();
+        camera.ptz_stop("one&two").await.unwrap();
         server.join().unwrap();
     }
 }

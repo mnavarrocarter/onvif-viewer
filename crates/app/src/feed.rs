@@ -9,6 +9,7 @@ use gst::prelude::*;
 use gstreamer as gst;
 use tokio::sync::watch;
 
+use crate::ptz::PtzControl;
 use crate::storage::Source;
 
 // Keep the RTSP jitter buffer bounded without forcing sinks to run unsynchronized.
@@ -48,6 +49,7 @@ struct Ui {
     window: glib::WeakRef<adw::Window>,
     snapshot_button: gtk::Button,
     record_button: gtk::Button,
+    ptz: Rc<PtzControl>,
     mute: gtk::ToggleButton,
     volume: gtk::Scale,
     choices: gtk::Box,
@@ -413,6 +415,7 @@ impl Ui {
     }
 
     fn close(&self) {
+        self.ptz.shutdown();
         self.cancel_snapshot();
         let mut state = self.state.borrow_mut();
         state.closed = true;
@@ -897,6 +900,30 @@ pub fn open(
         .build();
     let (_, header_height, _, _) = header.measure(gtk::Orientation::Vertical, video_width);
     window.set_default_size(video_width, video_height + header_height);
+    let token = source
+        .selected_profile
+        .as_ref()
+        .filter(|token| {
+            source
+                .profiles
+                .iter()
+                .any(|profile| &profile.token == *token)
+        })
+        .cloned()
+        .or_else(|| Source::default_profile(&source.profiles));
+    let window_weak = window.downgrade();
+    let ptz = PtzControl::new(source.clone(), token, move |error| {
+        if let Some(window) = window_weak.upgrade() {
+            let dialog = adw::MessageDialog::new(
+                Some(&window),
+                Some("Could not control camera"),
+                Some(&error),
+            );
+            dialog.add_response("close", "Close");
+            dialog.present();
+        }
+    });
+    toolbar.insert_child_after(&ptz.button(), Some(&volume));
     let ui = Rc::new(Ui {
         source: RefCell::new(source),
         title,
@@ -906,6 +933,7 @@ pub fn open(
         window: window.downgrade(),
         snapshot_button: snapshot_button.clone(),
         record_button: record_button.clone(),
+        ptz,
         mute: mute.clone(),
         volume: volume.clone(),
         choices,
@@ -914,6 +942,34 @@ pub fn open(
         state: RefCell::new(State::default()),
     });
     ui.update_profiles();
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = Rc::downgrade(&ui);
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if weak
+            .upgrade()
+            .is_some_and(|ui| ui.ptz.handle_key(key, true))
+        {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    keys.connect_key_released(move |_, key, _, _| {
+        if let Some(ui) = weak.upgrade() {
+            ui.ptz.handle_key(key, false);
+        }
+    });
+    window.add_controller(keys);
+    let weak = Rc::downgrade(&ui);
+    window.connect_is_active_notify(move |window| {
+        if !window.is_active()
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.ptz.deactivate();
+        }
+    });
     let weak = Rc::downgrade(&ui);
     mute.connect_toggled(move |button| {
         let muted = button.is_active();
@@ -983,6 +1039,7 @@ pub fn change_profile(window: &adw::Window, source: Source) {
                 .then(|| ui.upgrade())
                 .flatten()
         }) {
+            ui.ptz.deactivate();
             ui.cancel_snapshot();
             {
                 let mut state = ui.state.borrow_mut();
@@ -1021,6 +1078,19 @@ pub fn change_profile(window: &adw::Window, source: Source) {
                 profile.map_or("", |profile| &profile.name),
             ));
             *ui.source.borrow_mut() = source;
+            let source = ui.source.borrow().clone();
+            let token = source
+                .selected_profile
+                .as_ref()
+                .filter(|token| {
+                    source
+                        .profiles
+                        .iter()
+                        .any(|profile| &profile.token == *token)
+                })
+                .cloned()
+                .or_else(|| Source::default_profile(&source.profiles));
+            ui.ptz.configure(source, token);
             ui.update_profiles();
             ui.status.set_visible(true);
             ui.connect_camera();

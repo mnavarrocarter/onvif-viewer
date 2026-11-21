@@ -1,5 +1,6 @@
 mod feed;
 mod grid_playback;
+mod ptz;
 mod settings;
 mod storage;
 
@@ -169,6 +170,7 @@ fn same_source(a: &Source, b: &Source) -> bool {
 
 struct Tile {
     source: RefCell<Source>,
+    ptz: Rc<ptz::PtzControl>,
     playback: Rc<grid_playback::GridPlayback>,
     widget: gtk::AspectFrame,
     title: gtk::Label,
@@ -231,6 +233,26 @@ struct Library {
 }
 
 impl Library {
+    fn deactivate_ptz(&self) {
+        for tile in self.tiles.borrow().values() {
+            tile.ptz.deactivate();
+        }
+    }
+
+    fn grid_has_key_focus(&self, window: &ApplicationWindow) -> bool {
+        let mut focus = gtk::prelude::RootExt::focus(window);
+        while let Some(widget) = focus {
+            if widget.is::<gtk::Popover>() {
+                return false;
+            }
+            if widget == *self.grid.upcast_ref::<gtk::Widget>() {
+                return true;
+            }
+            focus = widget.parent();
+        }
+        false
+    }
+
     fn queue_grid_layout(self: &Rc<Self>) {
         if self.layout_pending.replace(true) {
             return;
@@ -263,20 +285,22 @@ impl Library {
     fn refresh(self: &Rc<Self>) {
         let sources = self.sources.borrow().clone();
         self.queue_grid_layout();
-        {
-            let mut tiles = self.tiles.borrow_mut();
-            tiles.retain(|id, tile| {
-                if sources.iter().any(|source| source.id == *id) {
-                    true
-                } else {
-                    tile.resume.set(false);
-                    tile.playback.close();
-                    if let Some(child) = tile.widget.parent() {
-                        self.grid.remove(&child);
-                    }
-                    false
-                }
-            });
+        let mut removed = Vec::new();
+        self.tiles.borrow_mut().retain(|id, tile| {
+            if sources.iter().any(|source| source.id == *id) {
+                true
+            } else {
+                removed.push(Rc::clone(tile));
+                false
+            }
+        });
+        for tile in removed {
+            tile.ptz.shutdown();
+            tile.resume.set(false);
+            tile.playback.close();
+            if let Some(child) = tile.widget.parent() {
+                self.grid.remove(&child);
+            }
         }
         if let Some(button) = self.header_add.upgrade() {
             button.set_visible(!sources.is_empty());
@@ -290,6 +314,11 @@ impl Library {
             let existing = self.tiles.borrow().get(&source.id).cloned();
             let tile = if let Some(tile) = existing {
                 if !same_source(&tile.source.borrow(), &source) {
+                    tile.ptz.configure(
+                        source.clone(),
+                        grid_playback::lowest_resolution_profile(&source.profiles)
+                            .map(|profile| profile.token.clone()),
+                    );
                     tile.playback.update_source(source.clone());
                     *tile.source.borrow_mut() = source.clone();
                     self.update_tile(&tile, &source);
@@ -310,6 +339,32 @@ impl Library {
         let playback = grid_playback::GridPlayback::new(source.clone());
         playback.set_muted(true);
         playback.set_volume(1.0);
+        let weak = Rc::downgrade(self);
+        let ptz = ptz::PtzControl::new(
+            source.clone(),
+            grid_playback::lowest_resolution_profile(&source.profiles)
+                .map(|profile| profile.token.clone()),
+            move |error| {
+                if let Some(library) = weak.upgrade() {
+                    library.toasts.add_toast(adw::Toast::new(&error));
+                }
+            },
+        );
+        let ptz_button = ptz.button();
+        let weak = Rc::downgrade(self);
+        let weak_ptz = Rc::downgrade(&ptz);
+        ptz_button.connect_toggled(move |button| {
+            if !button.is_active() {
+                return;
+            }
+            if let (Some(library), Some(current)) = (weak.upgrade(), weak_ptz.upgrade()) {
+                for tile in library.tiles.borrow().values() {
+                    if !Rc::ptr_eq(&tile.ptz, &current) {
+                        tile.ptz.deactivate();
+                    }
+                }
+            }
+        });
         let video = playback.widget();
         video.set_hexpand(true);
         video.set_vexpand(true);
@@ -340,6 +395,7 @@ impl Library {
         play.add_css_class("flat");
         play.add_css_class("circular");
         controls.append(&play);
+        controls.append(&ptz_button);
         let mute = gtk::ToggleButton::new();
         mute.set_icon_name("audio-volume-muted-symbolic");
         mute.set_tooltip_text(Some("Unmute"));
@@ -378,6 +434,7 @@ impl Library {
         let tile = Rc::new(Tile {
             source: RefCell::new(source.clone()),
             playback,
+            ptz,
             widget: aspect,
             title,
             choices,
@@ -498,6 +555,7 @@ impl Library {
         if self.shutting_down.get() {
             return;
         }
+        self.deactivate_ptz();
         if tile.open_feeds.get() == 0 {
             tile.resume.set(tile.playback.is_playing());
             tile.playback.stop();
@@ -1137,6 +1195,54 @@ fn build_ui(app: &Application) {
         load_retry: load_retry.clone(),
         empty_add: empty_add.clone(),
     });
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = Rc::downgrade(&library);
+    keys.connect_key_pressed(move |_, key, _, _| {
+        let Some(library) = weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        let Some(window) = library.window.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        if window.is_active()
+            && library.grid_has_key_focus(&window)
+            && library
+                .tiles
+                .borrow()
+                .values()
+                .any(|tile| tile.ptz.handle_key(key, true))
+        {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    let weak = Rc::downgrade(&library);
+    keys.connect_key_released(move |_, key, _, _| {
+        if let Some(library) = weak.upgrade() {
+            for tile in library.tiles.borrow().values() {
+                tile.ptz.handle_key(key, false);
+            }
+        }
+    });
+    window.add_controller(keys);
+    let weak = Rc::downgrade(&library);
+    window.connect_is_active_notify(move |window| {
+        if !window.is_active()
+            && let Some(library) = weak.upgrade()
+        {
+            library.deactivate_ptz();
+        }
+    });
+    let weak = Rc::downgrade(&library);
+    window.connect_focus_widget_notify(move |window| {
+        if let Some(library) = weak.upgrade()
+            && !library.grid_has_key_focus(window)
+        {
+            library.deactivate_ptz();
+        }
+    });
     for adjustment in [scroll.hadjustment(), scroll.vadjustment()] {
         let weak = Rc::downgrade(&library);
         adjustment.connect_changed(move |_| {
@@ -1150,6 +1256,7 @@ fn build_ui(app: &Application) {
         if let Some(library) = weak.upgrade() {
             library.shutting_down.set(true);
             for tile in library.tiles.borrow().values() {
+                tile.ptz.shutdown();
                 tile.resume.set(false);
                 tile.playback.close();
             }
