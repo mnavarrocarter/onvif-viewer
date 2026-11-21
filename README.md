@@ -34,7 +34,7 @@ cargo run
 
 Select **Add Camera**, then enter its ONVIF device service URL including its port, username, and password. Select a camera tile to open its feed. Use the tile's settings button to edit or remove the camera, and its profile menu to choose a stream; changing the profile also switches any open feeds.
 
-In a feed window, use **Take Snapshot** in the bottom toolbar to request a still image from the camera and choose where to save it. The snapshot uses the selected ONVIF media profile and may differ from the live video in resolution or timing. Capture and file errors are shown in the window.
+In a feed window, use **Take Snapshot** in the bottom toolbar to request a still image from the camera and choose where to save it. The snapshot uses the selected ONVIF media profile and may differ from the live video in resolution or timing. Capture and file errors are shown separately in the window. If capture fails, check that the camera's ONVIF snapshot service is enabled and reachable.
 
 Use **Record Clip** in that toolbar to choose a local `.mkv` destination and start recording the selected RTSP profile. The button changes to **Stop Recording** once recording starts and to **Saving recording…** while the file is finalized. The save location is chosen for each clip and is never stored with the camera configuration. Recording, finalization, and local-storage errors are shown in the feed window.
 

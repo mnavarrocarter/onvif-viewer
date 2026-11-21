@@ -206,13 +206,9 @@ impl Ui {
         self.snapshot_button.set_sensitive(false);
     }
 
-    fn snapshot_error(&self, message: &str) {
+    fn snapshot_error(&self, title: &str, message: &str) {
         if let Some(window) = self.window.upgrade() {
-            let dialog = adw::MessageDialog::new(
-                Some(&window),
-                Some("Could not save snapshot"),
-                Some(message),
-            );
+            let dialog = adw::MessageDialog::new(Some(&window), Some(title), Some(message));
             dialog.add_response("close", "Close");
             dialog.present();
         }
@@ -266,7 +262,10 @@ impl Ui {
                 }
             });
         if let Err(error) = worker {
-            self.snapshot_error(&format!("Could not start the snapshot worker: {error}"));
+            self.snapshot_error(
+                "Could not capture snapshot",
+                &format!("Could not start the snapshot worker: {error}"),
+            );
             return;
         }
         let mut state = self.state.borrow_mut();
@@ -347,13 +346,13 @@ impl Ui {
                             }
                             ui.snapshot_button.set_sensitive(true);
                             if let Err((_, error)) = result {
-                                ui.snapshot_error(&error.to_string());
+                                ui.snapshot_error("Could not save snapshot", &error.to_string());
                             }
                         },
                     );
                     return;
                 }
-                ui.snapshot_error("No destination was selected.");
+                ui.snapshot_error("Could not save snapshot", "No destination was selected.");
             }
             ui.snapshot_button.set_sensitive(true);
         });
@@ -584,7 +583,7 @@ impl Ui {
                     Ok(snapshot) => self.save_snapshot(snapshot),
                     Err(error) => {
                         self.snapshot_button.set_sensitive(true);
-                        self.snapshot_error(&error);
+                        self.snapshot_error("Could not capture snapshot", &error);
                     }
                 }
             }
@@ -594,7 +593,10 @@ impl Ui {
                 state.snapshot_cancel = None;
                 drop(state);
                 self.snapshot_button.set_sensitive(true);
-                self.snapshot_error("The snapshot worker ended unexpectedly.");
+                self.snapshot_error(
+                    "Could not capture snapshot",
+                    "The snapshot worker ended unexpectedly.",
+                );
             }
             _ => {}
         }

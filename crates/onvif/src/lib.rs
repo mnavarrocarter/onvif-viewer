@@ -266,6 +266,18 @@ fn snapshot_authorization(
     Err(error("Camera rejected snapshot authentication"))
 }
 
+fn snapshot_request_error(err: reqwest::Error) -> Error {
+    if err.is_timeout() {
+        error(
+            "Camera snapshot request timed out; check the camera's snapshot service and network connection",
+        )
+    } else {
+        error(
+            "Could not retrieve camera snapshot; check the camera's snapshot service and network connection",
+        )
+    }
+}
+
 async fn fetch_snapshot(
     client: &Client,
     mut url: Url,
@@ -281,14 +293,12 @@ async fn fetch_snapshot(
             }
             request.send()
         };
-        let mut response = send(None)
-            .await
-            .map_err(|_| error("Could not retrieve camera snapshot"))?;
+        let mut response = send(None).await.map_err(snapshot_request_error)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             let authorization = snapshot_authorization(&response, &url, username, password)?;
             response = send(Some(&authorization))
                 .await
-                .map_err(|_| error("Could not retrieve camera snapshot"))?;
+                .map_err(snapshot_request_error)?;
         }
         if response.status().is_redirection() {
             if redirects == MAX_SNAPSHOT_REDIRECTS {
@@ -948,6 +958,33 @@ mod tests {
             validate_snapshot_url(&Url::parse("https://camera:8443/image").unwrap(), &service)
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_connection_closed_reports_retrieval_without_leaking_url() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+        });
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let result = fetch_snapshot(
+            &client,
+            Url::parse(&format!("http://{address}/image?private=secret")).unwrap(),
+            "user",
+            "password",
+        )
+        .await;
+        let message = result.err().unwrap().to_string();
+        assert!(message.contains("retrieve camera snapshot"));
+        assert!(message.contains("snapshot service"));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("password"));
+        assert!(!message.contains(&address.to_string()));
+        server.join().unwrap();
     }
 
     #[tokio::test]
