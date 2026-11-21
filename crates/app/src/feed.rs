@@ -964,10 +964,10 @@ pub fn open(
     window.add_controller(keys);
     let weak = Rc::downgrade(&ui);
     window.connect_is_active_notify(move |window| {
-        if !window.is_active() {
-            if let Some(ui) = weak.upgrade() {
-                ui.ptz.deactivate();
-            }
+        if !window.is_active()
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.ptz.deactivate();
         }
     });
     let weak = Rc::downgrade(&ui);

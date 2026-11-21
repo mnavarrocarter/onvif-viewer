@@ -1229,18 +1229,18 @@ fn build_ui(app: &Application) {
     window.add_controller(keys);
     let weak = Rc::downgrade(&library);
     window.connect_is_active_notify(move |window| {
-        if !window.is_active() {
-            if let Some(library) = weak.upgrade() {
-                library.deactivate_ptz();
-            }
+        if !window.is_active()
+            && let Some(library) = weak.upgrade()
+        {
+            library.deactivate_ptz();
         }
     });
     let weak = Rc::downgrade(&library);
     window.connect_focus_widget_notify(move |window| {
-        if let Some(library) = weak.upgrade() {
-            if !library.grid_has_key_focus(window) {
-                library.deactivate_ptz();
-            }
+        if let Some(library) = weak.upgrade()
+            && !library.grid_has_key_focus(window)
+        {
+            library.deactivate_ptz();
         }
     });
     for adjustment in [scroll.hadjustment(), scroll.vadjustment()] {

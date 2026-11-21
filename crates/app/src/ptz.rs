@@ -40,41 +40,39 @@ async fn run_ptz(mut requests: watch::Receiver<PtzRequest>, events: mpsc::Sender
         let generation = request.target.as_ref().map(|target| target.generation);
         if current.as_ref().map(|(_, _, generation)| *generation) != generation || request.shutdown
         {
-            if let Some((camera, token, old_generation)) = current.take() {
-                if moving {
-                    if let Err(error) = camera.ptz_stop(&token).await {
-                        let _ = events.send(PtzEvent::Error(old_generation, error.to_string()));
-                    }
-                    moving = false;
+            if let Some((camera, token, old_generation)) = current.take()
+                && moving
+            {
+                if let Err(error) = camera.ptz_stop(&token).await {
+                    let _ = events.send(PtzEvent::Error(old_generation, error.to_string()));
                 }
+                moving = false;
             }
             if request.shutdown {
                 break;
             }
         }
-        if current.is_none() && failed_generation != generation {
-            if let Some(target) = &request.target {
-                let result = async {
-                    let camera = onvif::connect(
-                        &target.source.address,
-                        &target.source.username,
-                        &target.source.password,
-                    )
-                    .await?;
-                    let supported = camera.ptz_supported(&target.token).await?;
-                    Ok::<_, onvif::Error>((camera, supported))
-                }
-                .await;
-                match result {
-                    Ok((camera, supported)) => {
-                        let _ = events.send(PtzEvent::Supported(target.generation, supported));
-                        if supported {
-                            current = Some((camera, target.token.clone(), target.generation));
-                        } else {
-                            failed_generation = generation;
-                        }
-                    }
-                    Err(error) => {
+        if current.is_none()
+            && failed_generation != generation
+            && let Some(target) = &request.target
+        {
+            let result = async {
+                let camera = onvif::connect(
+                    &target.source.address,
+                    &target.source.username,
+                    &target.source.password,
+                )
+                .await?;
+                let supported = camera.ptz_supported(&target.token).await?;
+                Ok::<_, onvif::Error>((camera, supported))
+            }
+            .await;
+            match result {
+                Ok((camera, supported)) => {
+                    let _ = events.send(PtzEvent::Supported(target.generation, supported));
+                    if supported {
+                        current = Some((camera, target.token.clone(), target.generation));
+                    } else {
                         failed_generation = generation;
                         let _ = events.send(PtzEvent::Error(target.generation, error.to_string()));
                     }
@@ -201,10 +199,10 @@ impl PtzControl {
         let weak = Rc::downgrade(&control);
         button.connect_toggled(move |button| {
             icon.queue_draw();
-            if !button.is_active() {
-                if let Some(control) = weak.upgrade() {
-                    control.clear_keys();
-                }
+            if !button.is_active()
+                && let Some(control) = weak.upgrade()
+            {
+                control.clear_keys();
             }
         });
         control.configure(source, token);
@@ -236,8 +234,9 @@ impl PtzControl {
             .set_tooltip_text(Some("Checking pan/tilt support…"));
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
-        if !self.stopped.get() {
-            if let Some(sender) = &self.request {
+        if !self.stopped.get()
+            && let Some(sender) = &self.request
+        {
                 sender.send_modify(|request| {
                     request.direction = (0.0, 0.0);
                     request.target = token.map(|token| PtzTarget {
@@ -246,7 +245,6 @@ impl PtzControl {
                         generation,
                     });
                 });
-            }
         }
     }
 
