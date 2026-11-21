@@ -2,6 +2,14 @@
 
 A native Linux desktop application for viewing ONVIF cameras with GTK4, libadwaita, and GStreamer.
 
+## Screenshots
+
+![Empty camera library](screenshots/empty-state.png)
+
+![Camera library with two cameras](screenshots/cameras.png)
+
+![Camera feed with private content obscured](screenshots/live-feed.png)
+
 ## Requirements
 
 Rust stable, Cargo, `pkg-config`, GTK4, libadwaita 1.4 or later, and GStreamer development libraries are required to build. Playback also requires the GStreamer GTK4 paintable sink, RTSP, audio output and appropriate depayloader and decoder plugins for the camera's streams (for example H.264 and G.711 plugins).
