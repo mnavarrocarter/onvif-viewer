@@ -74,11 +74,14 @@ async fn run_ptz(mut requests: watch::Receiver<PtzRequest>, events: mpsc::Sender
                         current = Some((camera, target.token.clone(), target.generation));
                     } else {
                         failed_generation = generation;
-                        let _ = events.send(PtzEvent::Error(target.generation, error.to_string()));
                     }
                 }
-                continue;
+                Err(error) => {
+                    failed_generation = generation;
+                    let _ = events.send(PtzEvent::Error(target.generation, error.to_string()));
+                }
             }
+            continue;
         }
         if let Some((camera, token, generation)) = &current {
             let result = if request.direction != (0.0, 0.0) {
@@ -237,14 +240,14 @@ impl PtzControl {
         if !self.stopped.get()
             && let Some(sender) = &self.request
         {
-                sender.send_modify(|request| {
-                    request.direction = (0.0, 0.0);
-                    request.target = token.map(|token| PtzTarget {
-                        source,
-                        token,
-                        generation,
-                    });
+            sender.send_modify(|request| {
+                request.direction = (0.0, 0.0);
+                request.target = token.map(|token| PtzTarget {
+                    source,
+                    token,
+                    generation,
                 });
+            });
         }
     }
 
