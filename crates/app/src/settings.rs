@@ -154,10 +154,14 @@ pub fn open(
         .transient_for(parent)
         .destroy_with_parent(true)
         .modal(true)
-        .default_width(440)
-        .default_height(420)
+        .default_width(500)
         .content(&toolbar)
         .build();
+    // Keep the fallback scroller for small displays and long error messages.
+    // Initially fit the form at its chosen width instead of scrolling its rows.
+    let (_, body_height, _, _) = body.measure(gtk::Orientation::Vertical, 500);
+    let (_, header_height, _, _) = header.measure(gtk::Orientation::Vertical, 500);
+    window.set_default_size(500, (body_height + header_height + 24).max(480));
     let ui = Rc::new(Settings {
         window,
         name,

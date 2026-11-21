@@ -4,11 +4,7 @@ A native Linux desktop application for viewing ONVIF cameras with GTK4, libadwai
 
 ## Screenshots
 
-![Empty camera library](screenshots/empty-state.png)
-
-![Camera library with two cameras](screenshots/cameras.png)
-
-![Camera feed with private content obscured](screenshots/live-feed.png)
+![Main window with two camera feeds](screenshots/main-window.png)
 
 ## Requirements
 
@@ -32,15 +28,17 @@ cargo test --workspace --locked
 cargo run
 ```
 
-Select **Add Camera**, then enter its ONVIF device service URL including its port, username, and password. Select a camera tile to open its feed. Use the tile's settings button to edit or remove the camera, and its profile menu to choose a stream; changing the profile also switches any open feeds.
+Select **Add Camera**, then enter its ONVIF device service URL including its port, username, and password. Each camera appears in the main-window grid. Use its play button to start the lowest-resolution available profile; the button stops playback when selected again. Grid audio starts muted and can be adjusted with the tile's mute button and volume slider. Connection and playback errors appear on the affected tile.
 
-In a feed window, use **Take Snapshot** in the bottom toolbar to save the current decoded video frame as a JPEG. Snapshots use the live stream's resolution and may reflect its buffering delay; playback must be active. The suggested filename includes the local date and time. Capture and file errors are shown separately in the window.
+Select the video area to open a separate feed window. The grid stream stops while feed windows for that camera are open and resumes when the last one closes if it was playing before. Use the tile's settings button to edit or remove the camera. The profile menu on either surface chooses the profile for feed windows; changing it also switches any open feeds. The feed window has its own mute and volume controls.
 
-Use **Record Clip** in that toolbar to choose a local `.mkv` destination and start recording the selected RTSP profile. The suggested filename includes the local date and time. The button changes to **Stop Recording** once recording starts and to **Saving recording…** while the file is finalized. The save location is chosen for each clip and is never stored with the camera configuration. Recording, finalization, and local-storage errors are shown in the feed window.
+Use the camera icon on a playing tile or feed window to save the current decoded video frame as a JPEG. Snapshots use the live stream's resolution and may reflect its buffering delay. The suggested filename includes the local date and time. Capture and file errors are shown separately.
+
+Use the record icon to choose a local `.mkv` destination and record that surface's stream profile: the lowest-resolution profile for a grid tile, or the selected profile for a feed window. The icon changes to a stop button while recording; its tooltip reports when recording starts or the file is being saved. A grid recording continues when its preview is stopped or opened in a feed window. The save location is chosen for each clip and is never stored with the camera configuration.
 
 Recordings are remuxed rather than decoded and re-encoded, preserving compressed H.264/H.265 video and AAC, Opus, PCMA, or PCMU audio when the camera provides them. Other codecs are not currently recorded. Clips begin at the next usable stream data/keyframe and have no pre-event buffer; recording camera-side events and background/pre-event capture are intentionally outside this feature. Closing a feed requests a clean stop and lets the independent recorder finalize its file; do not force-quit the application while **Saving recording…** is displayed.
 
-Camera tiles and newly opened feed windows use the selected profile's aspect ratio when its dimensions are known. On Wayland, the compositor controls interactive window resizing, so the window itself cannot be locked to that ratio; the video remains undistorted and is letterboxed when necessary.
+The main-window grid chooses its columns using both available width and height to make camera tiles as large as practical; it scrolls when the cameras cannot all fit at a usable size. Tiles use the lowest-resolution profile's aspect ratio when its dimensions are known, and video remains undistorted. Newly opened feed windows use the selected profile's aspect ratio when its dimensions are known. On Wayland, the compositor controls interactive window resizing, so the window itself cannot be locked to a ratio; video is letterboxed when necessary.
 
 RTSP playback uses a 500 ms jitter buffer and drops packets when that buffer fills, rather than letting it grow without limit. This favors staying near live over uninterrupted playback: unstable networks can cause stutter, missing audio, or video artifacts until the next keyframe. GStreamer continues to synchronize audio and video. This bounds the RTSP jitter buffer, not total end-to-end delay; camera-side buffering, transport delays, decoding, and clock drift can still affect playback.
 

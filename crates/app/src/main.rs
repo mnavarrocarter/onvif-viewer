@@ -1,4 +1,5 @@
 mod feed;
+mod grid_playback;
 mod settings;
 mod storage;
 
@@ -16,6 +17,51 @@ use storage::{PersistentStore, Source, SourceStore};
 use tokio::sync::watch;
 
 const APP_ID: &str = "io.github.onvif_viewer.OnvifViewer";
+const GRID_MARGIN: i32 = 24;
+const GRID_SPACING: i32 = 18;
+// FlowBoxChild adds padding around each aspect frame.
+const GRID_CHILD_PADDING: f64 = 12.0;
+const MIN_TILE_WIDTH: f64 = 320.0;
+
+fn grid_layout(width: i32, height: i32, count: usize, min_ratio: f64) -> (u32, i32) {
+    let width = (width - 2 * GRID_MARGIN).max(1) as f64;
+    let height = (height - 2 * GRID_MARGIN).max(1) as f64;
+    let max_columns = count.clamp(1, 4);
+    let ratio = min_ratio.clamp(0.0001, 10000.0);
+    let mut best = None;
+    for columns in 1..=max_columns {
+        let rows = count.max(1).div_ceil(columns);
+        let horizontal_gaps = (columns - 1) as f64 * GRID_SPACING as f64;
+        let vertical_gaps = (rows - 1) as f64 * GRID_SPACING as f64;
+        let cell_width = (width - horizontal_gaps) / columns as f64 - GRID_CHILD_PADDING;
+        let cell_height = (height - vertical_gaps) / rows as f64 - GRID_CHILD_PADDING;
+        let tile_width = cell_width.min(cell_height * ratio);
+        if tile_width >= MIN_TILE_WIDTH && best.is_none_or(|(_, _, size)| tile_width > size) {
+            let grid_width = ((tile_width + GRID_CHILD_PADDING) * columns as f64 + horizontal_gaps)
+                .ceil() as i32;
+            best = Some((columns as u32, grid_width, tile_width));
+        }
+    }
+    if let Some((columns, grid_width, _)) = best {
+        (columns, grid_width)
+    } else {
+        // Keep controls usable and allow scrolling when no arrangement fits.
+        let columns = ((width + GRID_SPACING as f64)
+            / (MIN_TILE_WIDTH + GRID_CHILD_PADDING + GRID_SPACING as f64))
+            .floor()
+            .max(1.0) as usize;
+        (columns.min(max_columns) as u32, width as i32)
+    }
+}
+
+fn source_ratio(source: &Source) -> f32 {
+    grid_playback::lowest_resolution_profile(&source.profiles)
+        .and_then(|profile| profile.width.zip(profile.height))
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .map_or(16.0 / 9.0, |(width, height)| {
+            (width as f32 / height as f32).clamp(0.0001, 10000.0)
+        })
+}
 
 type StoreResult<T> = Result<T, String>;
 
@@ -121,10 +167,53 @@ fn same_source(a: &Source, b: &Source) -> bool {
         })
 }
 
+struct Tile {
+    source: RefCell<Source>,
+    playback: Rc<grid_playback::GridPlayback>,
+    widget: gtk::AspectFrame,
+    title: gtk::Label,
+    choices: gtk::Box,
+    play: gtk::Button,
+    open_feeds: Cell<usize>,
+    resume: Cell<bool>,
+}
+
+impl Tile {
+    fn update_play_button(&self) {
+        let playing = self.playback.is_playing();
+        self.play.set_icon_name(if playing {
+            "media-playback-stop-symbolic"
+        } else {
+            "media-playback-start-symbolic"
+        });
+        self.play
+            .set_tooltip_text(Some(if playing { "Stop" } else { "Play" }));
+    }
+
+    fn watch_playback(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(250), move || {
+            let Some(tile) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            tile.update_play_button();
+            if tile.playback.is_playing() {
+                glib::ControlFlow::Continue
+            } else {
+                glib::ControlFlow::Break
+            }
+        });
+    }
+}
+
 struct Library {
     window: glib::WeakRef<ApplicationWindow>,
     stack: gtk::Stack,
     grid: gtk::FlowBox,
+    grid_wrapper: gtk::Box,
+    scroll: gtk::ScrolledWindow,
+    layout_pending: Cell<bool>,
+    layout_size: Cell<(u32, i32)>,
     toasts: adw::ToastOverlay,
     header_add: glib::WeakRef<gtk::Button>,
     store: Option<mpsc::Sender<StoreRequest>>,
@@ -132,6 +221,8 @@ struct Library {
     busy: Cell<bool>,
     ready: Cell<bool>,
     feeds: RefCell<HashMap<u64, Vec<glib::WeakRef<adw::Window>>>>,
+    tiles: RefCell<HashMap<u64, Rc<Tile>>>,
+    shutting_down: Cell<bool>,
     next_id: Cell<Option<u64>>,
     loading: Cell<bool>,
     load_status: gtk::Label,
@@ -140,10 +231,52 @@ struct Library {
 }
 
 impl Library {
+    fn queue_grid_layout(self: &Rc<Self>) {
+        if self.layout_pending.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(library) = weak.upgrade() else {
+                return;
+            };
+            library.layout_pending.set(false);
+            let (width, height) = (library.scroll.width(), library.scroll.height());
+            if width <= 1 || height <= 1 {
+                return;
+            }
+            let sources = library.sources.borrow();
+            let ratio = sources
+                .iter()
+                .map(|source| source_ratio(source) as f64)
+                .fold(f64::INFINITY, f64::min);
+            let layout = grid_layout(width, height, sources.len(), ratio);
+            if library.layout_size.replace(layout) != layout {
+                library.grid.set_max_children_per_line(layout.0);
+                library
+                    .grid_wrapper
+                    .set_size_request(layout.1 + 2 * GRID_MARGIN, -1);
+            }
+        });
+    }
+
     fn refresh(self: &Rc<Self>) {
         let sources = self.sources.borrow().clone();
-        while let Some(child) = self.grid.first_child() {
-            self.grid.remove(&child);
+        self.queue_grid_layout();
+        {
+            let mut tiles = self.tiles.borrow_mut();
+            tiles.retain(|id, tile| {
+                if sources.iter().any(|source| source.id == *id) {
+                    true
+                } else {
+                    tile.resume.set(false);
+                    tile.playback.close();
+                    if let Some(child) = tile.widget.parent() {
+                        self.grid.remove(&child);
+                    }
+                    false
+                }
+            });
         }
         if let Some(button) = self.header_add.upgrade() {
             button.set_visible(!sources.is_empty());
@@ -154,155 +287,288 @@ impl Library {
             "sources"
         });
         for source in sources {
-            let contents = gtk::Box::new(gtk::Orientation::Vertical, 6);
-            contents.set_valign(gtk::Align::Center);
-            contents.set_margin_top(22);
-            contents.set_margin_bottom(54);
-            contents.set_margin_start(18);
-            contents.set_margin_end(18);
-            let title = gtk::Label::new(Some(&source.name));
-            title.add_css_class("heading");
-            title.set_wrap(true);
-            title.set_lines(2);
-            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            title.set_max_width_chars(30);
-            contents.append(&title);
-            let detail = format!("{}  ·  {}", source.model, source.serial);
-            let detail = gtk::Label::new(Some(&detail));
-            detail.add_css_class("dim-label");
-            detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            detail.set_max_width_chars(30);
-            contents.append(&detail);
-            let profile = gtk::Label::new(Some(&source.selected_profile_label()));
-            profile.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            profile.set_max_width_chars(30);
-            contents.append(&profile);
+            let existing = self.tiles.borrow().get(&source.id).cloned();
+            let tile = if let Some(tile) = existing {
+                if !same_source(&tile.source.borrow(), &source) {
+                    tile.playback.update_source(source.clone());
+                    *tile.source.borrow_mut() = source.clone();
+                    self.update_tile(&tile, &source);
+                }
+                tile
+            } else {
+                let tile = self.create_tile(&source);
+                self.update_tile(&tile, &source);
+                self.grid.insert(&tile.widget, -1);
+                self.tiles.borrow_mut().insert(source.id, Rc::clone(&tile));
+                tile
+            };
+            tile.update_play_button();
+        }
+    }
 
-            let open = gtk::Button::builder()
-                .child(&contents)
-                .hexpand(true)
-                .build();
-            open.add_css_class("card");
-            let parent = self.window.clone();
-            let camera = source.clone();
-            let library = Rc::downgrade(self);
-            open.connect_clicked(move |_| {
-                if let (Some(parent), Some(library)) = (parent.upgrade(), library.upgrade()) {
-                    let feed = feed::open(&parent, camera.clone());
-                    let mut feeds = library.feeds.borrow_mut();
-                    let windows = feeds.entry(camera.id).or_default();
-                    windows.retain(|window| window.upgrade().is_some());
-                    windows.push(feed.downgrade());
-                }
-            });
-            let configure = gtk::Button::from_icon_name("emblem-system-symbolic");
-            configure.set_tooltip_text(Some("Camera Settings"));
-            configure.add_css_class("flat");
-            configure.add_css_class("circular");
-            let weak = Rc::downgrade(self);
-            let camera = source.clone();
-            configure.connect_clicked(move |_| {
-                let Some(library) = weak.upgrade() else {
-                    return;
-                };
-                let Some(parent) = library.window.upgrade() else {
-                    return;
-                };
-                if library.busy.get() || !library.ready.get() {
-                    library
-                        .toasts
-                        .add_toast(adw::Toast::new("Wait for the camera change to finish."));
-                    return;
-                }
-                let save_library = Rc::clone(&library);
-                let remove_library = Rc::clone(&library);
-                settings::open(
-                    &parent,
-                    camera.clone(),
-                    move |source| save_library.save_source(source),
-                    move |id| remove_library.remove_source(id),
-                );
-            });
-            let choices = gtk::Box::new(gtk::Orientation::Vertical, 3);
-            choices.set_margin_top(6);
-            choices.set_margin_bottom(6);
-            choices.set_margin_start(6);
-            choices.set_margin_end(6);
-            for available in &source.profiles {
-                let selected = source.selected_profile.as_deref() == Some(available.token.as_str());
-                let label = if selected {
-                    format!("✓  {}", Source::profile_label(available))
+    fn create_tile(self: &Rc<Self>, source: &Source) -> Rc<Tile> {
+        let playback = grid_playback::GridPlayback::new(source.clone());
+        playback.set_muted(true);
+        playback.set_volume(1.0);
+        let video = playback.widget();
+        video.set_hexpand(true);
+        video.set_vexpand(true);
+        let card = gtk::Overlay::new();
+        card.set_child(Some(&video));
+        let title = gtk::Label::new(Some(&source.name));
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        title.set_halign(gtk::Align::Start);
+        title.set_valign(gtk::Align::Start);
+        title.set_margin_top(8);
+        title.set_margin_start(8);
+        title.add_css_class("grid-video-label");
+        card.add_overlay(&title);
+
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        controls.add_css_class("grid-controls");
+        controls.set_halign(gtk::Align::Fill);
+        controls.set_valign(gtk::Align::End);
+        controls.set_margin_start(8);
+        controls.set_margin_end(8);
+        controls.set_margin_bottom(8);
+        let configure = gtk::Button::from_icon_name("emblem-system-symbolic");
+        configure.set_tooltip_text(Some("Camera Settings"));
+        configure.add_css_class("flat");
+        configure.add_css_class("circular");
+        controls.append(&configure);
+        let play = gtk::Button::from_icon_name("media-playback-start-symbolic");
+        play.add_css_class("flat");
+        play.add_css_class("circular");
+        controls.append(&play);
+        let mute = gtk::ToggleButton::new();
+        mute.set_icon_name("audio-volume-muted-symbolic");
+        mute.set_tooltip_text(Some("Unmute"));
+        mute.set_active(true);
+        mute.add_css_class("flat");
+        mute.add_css_class("circular");
+        controls.append(&mute);
+        let volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
+        volume.set_value(1.0);
+        volume.set_draw_value(false);
+        volume.set_size_request(70, -1);
+        volume.set_hexpand(true);
+        volume.set_tooltip_text(Some("Volume"));
+        controls.append(&volume);
+        controls.append(playback.snapshot_button());
+        controls.append(playback.record_button());
+        let choices = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        choices.set_margin_top(6);
+        choices.set_margin_bottom(6);
+        choices.set_margin_start(6);
+        choices.set_margin_end(6);
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&choices));
+        let profiles = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .popover(&popover)
+            .tooltip_text("Select Profile")
+            .build();
+        profiles.add_css_class("flat");
+        profiles.add_css_class("circular");
+        controls.append(&profiles);
+        card.add_overlay(&controls);
+        let aspect = gtk::AspectFrame::new(0.5, 0.5, 16.0 / 9.0, false);
+        aspect.set_size_request(320, 180);
+        aspect.set_child(Some(&card));
+        let tile = Rc::new(Tile {
+            source: RefCell::new(source.clone()),
+            playback,
+            widget: aspect,
+            title,
+            choices,
+            play: play.clone(),
+            open_feeds: Cell::new(0),
+            resume: Cell::new(false),
+        });
+
+        let weak_tile = Rc::downgrade(&tile);
+        play.connect_clicked(move |_| {
+            if let Some(tile) = weak_tile.upgrade() {
+                if tile.playback.is_playing() {
+                    tile.playback.stop();
                 } else {
-                    format!("    {}", Source::profile_label(available))
+                    tile.playback.play();
+                    tile.watch_playback();
+                }
+                tile.update_play_button();
+            }
+        });
+        let playback = Rc::clone(&tile.playback);
+        mute.connect_toggled(move |button| {
+            let muted = button.is_active();
+            playback.set_muted(muted);
+            button.set_icon_name(if muted {
+                "audio-volume-muted-symbolic"
+            } else {
+                "audio-volume-high-symbolic"
+            });
+            button.set_tooltip_text(Some(if muted { "Unmute" } else { "Mute" }));
+        });
+        let playback = Rc::clone(&tile.playback);
+        volume.connect_value_changed(move |volume| playback.set_volume(volume.value()));
+        let weak = Rc::downgrade(self);
+        let weak_tile = Rc::downgrade(&tile);
+        configure.connect_clicked(move |_| {
+            let (Some(library), Some(tile)) = (weak.upgrade(), weak_tile.upgrade()) else {
+                return;
+            };
+            let Some(parent) = library.window.upgrade() else {
+                return;
+            };
+            if library.busy.get() || !library.ready.get() {
+                library
+                    .toasts
+                    .add_toast(adw::Toast::new("Wait for the camera change to finish."));
+                return;
+            }
+            let save_library = Rc::clone(&library);
+            let remove_library = Rc::clone(&library);
+            settings::open(
+                &parent,
+                tile.source.borrow().clone(),
+                move |source| save_library.save_source(source),
+                move |id| remove_library.remove_source(id),
+            );
+        });
+        let gesture = gtk::GestureClick::new();
+        let weak = Rc::downgrade(self);
+        let weak_tile = Rc::downgrade(&tile);
+        gesture.connect_released(move |_, _, _, _| {
+            let (Some(library), Some(tile)) = (weak.upgrade(), weak_tile.upgrade()) else {
+                return;
+            };
+            library.open_feed(&tile);
+        });
+        video.add_controller(gesture);
+        tile
+    }
+
+    fn update_tile(self: &Rc<Self>, tile: &Rc<Tile>, source: &Source) {
+        tile.widget.set_ratio(source_ratio(source));
+        tile.title.set_text(&source.name);
+        while let Some(child) = tile.choices.first_child() {
+            tile.choices.remove(&child);
+        }
+        for available in &source.profiles {
+            let selected = source.selected_profile.as_deref() == Some(available.token.as_str());
+            let label = format!(
+                "{}  {}",
+                if selected { "✓" } else { " " },
+                Source::profile_label(available)
+            );
+            let choice = gtk::Button::with_label(&label);
+            choice.add_css_class("flat");
+            let weak = Rc::downgrade(self);
+            let weak_tile = Rc::downgrade(tile);
+            let token = available.token.clone();
+            choice.connect_clicked(move |_| {
+                if selected {
+                    return;
+                }
+                let (Some(library), Some(tile)) = (weak.upgrade(), weak_tile.upgrade()) else {
+                    return;
                 };
-                let choice = gtk::Button::with_label(&label);
-                choice.add_css_class("flat");
-                let weak = Rc::downgrade(self);
-                let camera = source.clone();
-                let token = available.token.clone();
-                choice.connect_clicked(move |_| {
-                    if !selected && let Some(library) = weak.upgrade() {
-                        let mut camera = camera.clone();
-                        camera.selected_profile = Some(token.clone());
-                        let rx = library.save_source(camera);
-                        let weak = Rc::downgrade(&library);
-                        await_store(rx, move |result| {
-                            if let (Err(error), Some(library)) = (result, weak.upgrade()) {
-                                library.toasts.add_toast(adw::Toast::new(&error));
-                            }
-                        });
+                let mut camera = tile.source.borrow().clone();
+                camera.selected_profile = Some(token.clone());
+                let rx = library.save_source(camera);
+                let weak = Rc::downgrade(&library);
+                await_store(rx, move |result| {
+                    if let (Err(error), Some(library)) = (result, weak.upgrade()) {
+                        library.toasts.add_toast(adw::Toast::new(&error));
                     }
                 });
-                choices.append(&choice);
-            }
-            if source.profiles.is_empty() {
-                choices.append(&gtk::Label::new(Some("No profiles available")));
-            }
-            let popover = gtk::Popover::new();
-            popover.set_child(Some(&choices));
-            let profiles = gtk::MenuButton::builder()
-                .icon_name("view-more-symbolic")
-                .popover(&popover)
-                .tooltip_text("Select Profile")
-                .build();
-            profiles.add_css_class("flat");
-            profiles.add_css_class("circular");
-            configure.set_halign(gtk::Align::Start);
-            configure.set_valign(gtk::Align::End);
-            configure.set_margin_start(8);
-            configure.set_margin_bottom(8);
-            profiles.set_halign(gtk::Align::End);
-            profiles.set_valign(gtk::Align::End);
-            profiles.set_margin_end(8);
-            profiles.set_margin_bottom(8);
-            let card = gtk::Overlay::new();
-            let dimensions = source
-                .selected_profile
-                .as_ref()
-                .and_then(|token| {
-                    source
-                        .profiles
-                        .iter()
-                        .find(|profile| &profile.token == token)
-                })
-                .and_then(|profile| profile.width.zip(profile.height))
-                .filter(|(width, height)| *width > 0 && *height > 0);
-            let ratio = dimensions
-                .map(|(width, height)| (width as f64 / height as f64).clamp(0.0001, 10000.0))
-                .unwrap_or(16.0 / 9.0);
-            let height = (320.0_f64 / ratio).min(400.0);
-            let width = height * ratio;
-            let aspect = gtk::AspectFrame::new(0.5, 0.5, ratio as f32, false);
-            aspect.set_size_request(
-                (width.round() as i32).max(1),
-                (height.round() as i32).max(1),
-            );
-            card.set_child(Some(&open));
-            card.add_overlay(&configure);
-            card.add_overlay(&profiles);
-            aspect.set_child(Some(&card));
-            self.grid.insert(&aspect, -1);
+            });
+            tile.choices.append(&choice);
         }
+        if source.profiles.is_empty() {
+            tile.choices
+                .append(&gtk::Label::new(Some("No profiles available")));
+        }
+    }
+
+    fn open_feed(self: &Rc<Self>, tile: &Rc<Tile>) {
+        let Some(parent) = self.window.upgrade() else {
+            return;
+        };
+        if self.shutting_down.get() {
+            return;
+        }
+        if tile.open_feeds.get() == 0 {
+            tile.resume.set(tile.playback.is_playing());
+            tile.playback.stop();
+            tile.update_play_button();
+            tile.play.set_sensitive(false);
+        }
+        tile.open_feeds.set(tile.open_feeds.get() + 1);
+        let camera = tile.source.borrow().clone();
+        let weak = Rc::downgrade(self);
+        let id = camera.id;
+        let feed = feed::open(&parent, camera.clone(), move |token: String| {
+            let Some(library) = weak.upgrade() else {
+                return;
+            };
+            let Some(mut source) = library
+                .sources
+                .borrow()
+                .iter()
+                .find(|source| source.id == id)
+                .cloned()
+            else {
+                library
+                    .toasts
+                    .add_toast(adw::Toast::new("This camera is no longer in the library."));
+                return;
+            };
+            source.selected_profile = Some(token);
+            let rx = library.save_source(source);
+            let weak = Rc::downgrade(&library);
+            await_store(rx, move |result| {
+                if let (Err(error), Some(library)) = (result, weak.upgrade()) {
+                    library.toasts.add_toast(adw::Toast::new(&error));
+                }
+            });
+        });
+        let id = camera.id;
+        let weak = Rc::downgrade(self);
+        let weak_tile = Rc::downgrade(tile);
+        let closed = Cell::new(false);
+        let restore = Rc::new(move || {
+            if closed.replace(true) {
+                return;
+            }
+            if let (Some(library), Some(tile)) = (weak.upgrade(), weak_tile.upgrade()) {
+                let remaining = tile.open_feeds.get().saturating_sub(1);
+                tile.open_feeds.set(remaining);
+                if remaining == 0 {
+                    tile.play.set_sensitive(true);
+                    let present = library
+                        .tiles
+                        .borrow()
+                        .get(&id)
+                        .is_some_and(|current| Rc::ptr_eq(current, &tile));
+                    if tile.resume.replace(false) && present && !library.shutting_down.get() {
+                        tile.playback.play();
+                        tile.watch_playback();
+                    }
+                    tile.update_play_button();
+                }
+            }
+        });
+        let on_close = Rc::clone(&restore);
+        feed.connect_close_request(move |_| {
+            on_close();
+            glib::Propagation::Proceed
+        });
+        feed.connect_hide(move |_| restore());
+        let mut feeds = self.feeds.borrow_mut();
+        let windows = feeds.entry(camera.id).or_default();
+        windows.retain(|window| window.upgrade().is_some());
+        windows.push(feed.downgrade());
     }
 
     fn load(self: &Rc<Self>, done: impl FnOnce(StoreResult<()>) + 'static) {
@@ -347,6 +613,9 @@ impl Library {
                         library.feeds.borrow_mut().retain(|id, windows| {
                             let Some(source) = sources.iter().find(|source| source.id == *id)
                             else {
+                                if let Some(tile) = library.tiles.borrow().get(id) {
+                                    tile.resume.set(false);
+                                }
                                 for window in windows.iter().filter_map(|window| window.upgrade()) {
                                     window.close();
                                 }
@@ -489,6 +758,9 @@ impl Library {
                     .sources
                     .borrow_mut()
                     .retain(|source| source.id != id);
+                if let Some(tile) = library.tiles.borrow().get(&id) {
+                    tile.resume.set(false);
+                }
                 if let Some(windows) = library.feeds.borrow_mut().remove(&id) {
                     for window in windows {
                         if let Some(window) = window.upgrade() {
@@ -727,6 +999,34 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &Application) {
+    let css = gtk::CssProvider::new();
+    css.load_from_data(
+        ".grid-video-label, .grid-status {
+            color: white;
+            text-shadow: -1px -1px 2px black, 1px 1px 2px black, 0 0 3px black;
+        }
+        .grid-controls button {
+            color: white;
+            -gtk-icon-shadow: -1px -1px 2px black, 1px 1px 2px black, 0 0 3px black;
+        }
+        .grid-controls button.recording {
+            color: @error_color;
+        }
+        .grid-controls scale trough {
+            border: 1px solid alpha(black, 0.75);
+            box-shadow: 0 1px 3px alpha(black, 0.8);
+        }
+        .grid-controls scale slider {
+            box-shadow: 0 1px 3px alpha(black, 0.8);
+        }",
+    );
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
     let empty = adw::StatusPage::builder()
         .icon_name("camera-web-symbolic")
         .title("No Cameras")
@@ -754,15 +1054,21 @@ fn build_ui(app: &Application) {
 
     let grid = gtk::FlowBox::new();
     grid.set_selection_mode(gtk::SelectionMode::None);
+    grid.set_homogeneous(true);
     grid.set_max_children_per_line(4);
-    grid.set_column_spacing(18);
-    grid.set_row_spacing(18);
-    grid.set_margin_top(24);
-    grid.set_margin_bottom(24);
-    grid.set_margin_start(24);
-    grid.set_margin_end(24);
+    grid.set_column_spacing(GRID_SPACING as u32);
+    grid.set_row_spacing(GRID_SPACING as u32);
+    grid.set_margin_top(GRID_MARGIN);
+    grid.set_margin_bottom(GRID_MARGIN);
+    grid.set_margin_start(GRID_MARGIN);
+    grid.set_margin_end(GRID_MARGIN);
+    grid.set_hexpand(true);
     grid.set_valign(gtk::Align::Start);
-    let scroll = gtk::ScrolledWindow::builder().child(&grid).build();
+    let grid_wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    grid_wrapper.set_halign(gtk::Align::Center);
+    grid_wrapper.set_valign(gtk::Align::Start);
+    grid_wrapper.append(&grid);
+    let scroll = gtk::ScrolledWindow::builder().child(&grid_wrapper).build();
     let stack = gtk::Stack::new();
     stack.add_named(&load_body, Some("loading"));
     stack.set_visible_child_name("loading");
@@ -812,6 +1118,10 @@ fn build_ui(app: &Application) {
         window: window.downgrade(),
         stack,
         grid,
+        grid_wrapper,
+        scroll: scroll.clone(),
+        layout_pending: Cell::new(false),
+        layout_size: Cell::new((0, 0)),
         toasts,
         header_add: add.downgrade(),
         store: start_store_worker(),
@@ -819,11 +1129,32 @@ fn build_ui(app: &Application) {
         busy: Cell::new(false),
         ready: Cell::new(false),
         feeds: RefCell::new(HashMap::new()),
+        tiles: RefCell::new(HashMap::new()),
+        shutting_down: Cell::new(false),
         next_id: Cell::new(Some(1)),
         loading: Cell::new(false),
         load_status,
         load_retry: load_retry.clone(),
         empty_add: empty_add.clone(),
+    });
+    for adjustment in [scroll.hadjustment(), scroll.vadjustment()] {
+        let weak = Rc::downgrade(&library);
+        adjustment.connect_changed(move |_| {
+            if let Some(library) = weak.upgrade() {
+                library.queue_grid_layout();
+            }
+        });
+    }
+    let weak = Rc::downgrade(&library);
+    window.connect_close_request(move |_| {
+        if let Some(library) = weak.upgrade() {
+            library.shutting_down.set(true);
+            for tile in library.tiles.borrow().values() {
+                tile.resume.set(false);
+                tile.playback.close();
+            }
+        }
+        glib::Propagation::Proceed
     });
     let strong = Rc::clone(&library);
     add.connect_clicked(move |_| add_camera(&strong));
@@ -841,4 +1172,33 @@ fn build_ui(app: &Application) {
     });
     library.load(|_| {});
     window.present();
+}
+
+#[cfg(test)]
+mod grid_layout_tests {
+    use super::grid_layout;
+
+    #[test]
+    fn uses_height_to_choose_larger_tiles() {
+        let ratio = 16.0 / 9.0;
+        assert_eq!(grid_layout(750, 1000, 2, ratio).0, 1);
+        assert_eq!(grid_layout(1500, 600, 2, ratio).0, 2);
+        assert_eq!(grid_layout(900, 500, 2, ratio).0, 2);
+        assert_eq!(grid_layout(900, 1100, 2, ratio).0, 1);
+    }
+
+    #[test]
+    fn reserves_height_for_portrait_feeds() {
+        let landscape = grid_layout(1100, 1000, 2, 16.0 / 9.0);
+        let portrait = grid_layout(1100, 1000, 2, 9.0 / 16.0);
+        assert_eq!(landscape.0, 1);
+        assert_eq!(portrait.0, 2);
+    }
+
+    #[test]
+    fn keeps_tiles_usable_when_scrolling_is_necessary() {
+        let (columns, width) = grid_layout(750, 200, 8, 16.0 / 9.0);
+        assert_eq!(columns, 2);
+        assert_eq!(width, 702);
+    }
 }

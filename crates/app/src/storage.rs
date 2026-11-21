@@ -44,14 +44,6 @@ impl Source {
             .or_else(|| profiles.first())
             .map(|profile| profile.token.clone())
     }
-
-    pub fn selected_profile_label(&self) -> String {
-        self.selected_profile
-            .as_ref()
-            .and_then(|token| self.profiles.iter().find(|profile| &profile.token == token))
-            .map(Self::profile_label)
-            .unwrap_or_else(|| "No profile available".to_owned())
-    }
 }
 
 pub type StorageError = Box<dyn std::error::Error + Send + Sync>;
