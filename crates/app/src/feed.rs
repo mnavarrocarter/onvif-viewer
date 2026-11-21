@@ -34,6 +34,11 @@ struct State {
     snapshot_dialog: Option<gtk::FileChooserNative>,
     snapshot_save: Option<gtk::gio::Cancellable>,
     snapshot_generation: u64,
+    recording: Option<recording::Recording>,
+    recording_dialog: Option<gtk::FileChooserNative>,
+    recording_starting: bool,
+    recording_stopping: bool,
+    stream_uri: Option<String>,
     closed: bool,
     player: Option<gst::Element>,
     last_drop: Option<Instant>,
@@ -48,6 +53,7 @@ struct Ui {
     picture: gtk::Picture,
     window: glib::WeakRef<adw::Window>,
     snapshot_button: gtk::Button,
+    record_button: gtk::Button,
     state: RefCell<State>,
 }
 
@@ -67,6 +73,116 @@ fn stop_player(state: &mut State) {
 }
 
 impl Ui {
+    fn recording_error(&self, message: &str) {
+        if let Some(window) = self.window.upgrade() {
+            let dialog = adw::MessageDialog::new(
+                Some(&window),
+                Some("Could not record camera feed"),
+                Some(message),
+            );
+            dialog.add_response("close", "Close");
+            dialog.present();
+        }
+    }
+
+    fn update_record_button(&self) {
+        let state = self.state.borrow();
+        if state.recording_starting {
+            self.record_button.set_label("Starting recording…");
+            self.record_button.set_sensitive(false);
+        } else if state.recording_stopping {
+            self.record_button.set_label("Saving recording…");
+            self.record_button.set_sensitive(false);
+        } else if state.recording.is_some() {
+            self.record_button.set_label("Stop Recording");
+            self.record_button.set_sensitive(true);
+        } else {
+            self.record_button.set_label("Record Clip");
+            self.record_button
+                .set_sensitive(state.stream_uri.is_some() && !state.closed);
+        }
+    }
+
+    fn start_recording(&self, destination: std::path::PathBuf) {
+        if let Err(error) = recording::validate_destination(&destination) {
+            self.recording_error(&error);
+            return;
+        }
+        let uri = {
+            let state = self.state.borrow();
+            if state.closed || state.recording.is_some() {
+                return;
+            }
+            let Some(uri) = state.stream_uri.clone() else {
+                return;
+            };
+            uri
+        };
+        let source = self.source.borrow();
+        let request = recording::Request {
+            uri,
+            username: source.username.clone(),
+            password: source.password.clone(),
+            destination,
+        };
+        drop(source);
+        match recording::Recording::start(request) {
+            Ok(recorder) => {
+                let mut state = self.state.borrow_mut();
+                state.recording = Some(recorder);
+                state.recording_starting = true;
+                drop(state);
+                self.update_record_button();
+            }
+            Err(error) => self.recording_error(&error),
+        }
+    }
+
+    fn choose_recording_destination(self: &Rc<Self>) {
+        if self.state.borrow().recording.is_some() {
+            self.stop_recording();
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let dialog = gtk::FileChooserNative::new(
+            Some("Save Recording"),
+            Some(&window),
+            gtk::FileChooserAction::Save,
+            Some("Start Recording"),
+            Some("Cancel"),
+        );
+        dialog.set_modal(true);
+        dialog.set_current_name(&recording::default_filename(&self.source.borrow().name));
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(move |dialog, response| {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.state.borrow_mut().recording_dialog = None;
+            if response == gtk::ResponseType::Accept {
+                if let Some(path) = dialog.file().and_then(|file| file.path()) {
+                    ui.start_recording(path);
+                } else {
+                    ui.recording_error("No local recording location was selected.");
+                }
+            }
+            ui.update_record_button();
+        });
+        self.state.borrow_mut().recording_dialog = Some(dialog.clone());
+        self.record_button.set_sensitive(false);
+        dialog.show();
+    }
+
+    fn stop_recording(&self) {
+        let mut state = self.state.borrow_mut();
+        if let Some(recorder) = &state.recording {
+            recorder.stop();
+            state.recording_stopping = true;
+        }
+        drop(state);
+        self.update_record_button();
+    }
+
     fn cancel_snapshot(&self) {
         let (cancel, dialog, save) = {
             let mut state = self.state.borrow_mut();
@@ -249,6 +365,12 @@ impl Ui {
         self.cancel_snapshot();
         let mut state = self.state.borrow_mut();
         state.closed = true;
+        if let Some(dialog) = state.recording_dialog.take() {
+            dialog.hide();
+        }
+        if let Some(recorder) = &state.recording {
+            recorder.stop();
+        }
         if let Some(cancel) = state.cancel.take() {
             let _ = cancel.send(true);
         }
@@ -425,8 +547,12 @@ impl Ui {
                         profile,
                         token,
                     } => {
-                        self.state.borrow_mut().profile_token = Some(token);
+                        let mut state = self.state.borrow_mut();
+                        state.profile_token = Some(token);
+                        state.stream_uri = Some(uri.clone());
+                        drop(state);
                         self.snapshot_button.set_sensitive(true);
+                        self.update_record_button();
                         self.title
                             .set_subtitle(&subtitle(&self.source.borrow().model, &profile));
                         match self.start_player(&uri) {
@@ -471,6 +597,46 @@ impl Ui {
                 self.snapshot_error("The snapshot worker ended unexpectedly.");
             }
             _ => {}
+        }
+        let recording_event = {
+            let state = self.state.borrow();
+            state
+                .recording
+                .as_ref()
+                .map(|recording| recording.try_event())
+        };
+        match recording_event {
+            Some(Ok(recording::Event::Started)) => {
+                self.state.borrow_mut().recording_starting = false;
+                self.update_record_button();
+            }
+            Some(Ok(recording::Event::Finished)) => {
+                let mut state = self.state.borrow_mut();
+                state.recording = None;
+                state.recording_starting = false;
+                state.recording_stopping = false;
+                drop(state);
+                self.update_record_button();
+            }
+            Some(Ok(recording::Event::Failed(error))) => {
+                let mut state = self.state.borrow_mut();
+                state.recording = None;
+                state.recording_starting = false;
+                state.recording_stopping = false;
+                drop(state);
+                self.update_record_button();
+                self.recording_error(&error);
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                let mut state = self.state.borrow_mut();
+                state.recording = None;
+                state.recording_starting = false;
+                state.recording_stopping = false;
+                drop(state);
+                self.update_record_button();
+                self.recording_error("The recording worker ended unexpectedly.");
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
         }
         let mut failed = false;
         let mut dropped = 0_u64;
@@ -627,6 +793,10 @@ pub fn open(parent: &adw::ApplicationWindow, source: Source) -> adw::Window {
     snapshot_button.set_tooltip_text(Some("Take a snapshot"));
     snapshot_button.set_sensitive(false);
     toolbar.append(&snapshot_button);
+    let record_button = gtk::Button::with_label("Record Clip");
+    record_button.set_tooltip_text(Some("Record a clip to a local Matroska file"));
+    record_button.set_sensitive(false);
+    toolbar.append(&record_button);
     layout.add_bottom_bar(&toolbar);
     layout.set_content(Some(&overlay));
     let window = adw::Window::builder()
@@ -649,12 +819,19 @@ pub fn open(parent: &adw::ApplicationWindow, source: Source) -> adw::Window {
         picture,
         window: window.downgrade(),
         snapshot_button: snapshot_button.clone(),
+        record_button: record_button.clone(),
         state: RefCell::new(State::default()),
     });
     let weak = Rc::downgrade(&ui);
     snapshot_button.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
             ui.capture();
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    record_button.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.choose_recording_destination();
         }
     });
     WINDOWS.with(|windows| {
@@ -701,6 +878,7 @@ pub fn change_profile(window: &adw::Window, source: Source) {
                 }
                 state.responses = None;
                 state.profile_token = None;
+                state.stream_uri = None;
                 stop_player(&mut state);
             }
             ui.drop_indicator.set_visible(false);

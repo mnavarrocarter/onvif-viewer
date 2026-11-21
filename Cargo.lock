@@ -1554,6 +1554,7 @@ dependencies = [
  "keyring",
  "libadwaita",
  "onvif",
+ "recording",
  "rusqlite",
  "tempfile",
  "tokio",
@@ -1866,6 +1867,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb95882a1e14462c69aea9984bb261293ccfe6022ef8de0eda18bd5afb0052df"
 dependencies = [
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "recording"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
 ]
 
 [[package]]

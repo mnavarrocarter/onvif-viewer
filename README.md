@@ -12,7 +12,7 @@ A native Linux desktop application for viewing ONVIF cameras with GTK4, libadwai
 
 ## Requirements
 
-Rust stable, Cargo, `pkg-config`, GTK4, libadwaita 1.4 or later, and GStreamer development libraries are required to build. Playback also requires the GStreamer GTK4 paintable sink, RTSP, audio output and appropriate depayloader and decoder plugins for the camera's streams (for example H.264 and G.711 plugins).
+Rust stable, Cargo, `pkg-config`, GTK4, libadwaita 1.4 or later, and GStreamer development libraries are required to build. Playback also requires the GStreamer GTK4 paintable sink, RTSP, audio output and appropriate depayloader and decoder plugins for the camera's streams (for example H.264 and G.711 plugins). Recording additionally requires the Matroska muxer and appropriate RTP depayloaders/parsers.
 
 ## Continuous integration
 
@@ -35,6 +35,10 @@ cargo run
 Select **Add Camera**, then enter its ONVIF device service URL including its port, username, and password. Select a camera tile to open its feed. Use the tile's settings button to edit or remove the camera, and its profile menu to choose a stream; changing the profile also switches any open feeds.
 
 In a feed window, use **Take Snapshot** in the bottom toolbar to request a still image from the camera and choose where to save it. The snapshot uses the selected ONVIF media profile and may differ from the live video in resolution or timing. Capture and file errors are shown in the window.
+
+Use **Record Clip** in that toolbar to choose a local `.mkv` destination and start recording the selected RTSP profile. The button changes to **Stop Recording** once recording starts and to **Saving recording…** while the file is finalized. The save location is chosen for each clip and is never stored with the camera configuration. Recording, finalization, and local-storage errors are shown in the feed window.
+
+Recordings are remuxed rather than decoded and re-encoded, preserving compressed H.264/H.265 video and AAC, Opus, PCMA, or PCMU audio when the camera provides them. Other codecs are not currently recorded. Clips begin at the next usable stream data/keyframe and have no pre-event buffer; recording camera-side events and background/pre-event capture are intentionally outside this feature. Closing a feed requests a clean stop and lets the independent recorder finalize its file; do not force-quit the application while **Saving recording…** is displayed.
 
 Camera tiles and newly opened feed windows use the selected profile's aspect ratio when its dimensions are known. On Wayland, the compositor controls interactive window resizing, so the window itself cannot be locked to that ratio; the video remains undistorted and is letterboxed when necessary.
 
