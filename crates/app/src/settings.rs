@@ -46,10 +46,28 @@ impl Settings {
         self.status.add_css_class("error");
         self.status.set_text(message);
     }
+
+    fn finish_operation(self: &Rc<Self>, rx: mpsc::Receiver<Result<(), String>>) {
+        self.cancel.borrow_mut().take();
+        self.set_busy(true);
+        self.status.remove_css_class("error");
+        self.status.set_text("Saving camera library…");
+        let weak = Rc::downgrade(self);
+        crate::await_store(rx, move |result| {
+            let Some(ui) = weak.upgrade() else { return };
+            if ui.closed.get() {
+                return;
+            }
+            match result {
+                Ok(()) => ui.window.close(),
+                Err(error) => ui.show_error(&error),
+            }
+        });
+    }
 }
 
 // Only display messages we control, never potentially sensitive device responses.
-fn connection_error(error: &onvif::Error) -> &'static str {
+pub(crate) fn connection_error(error: &onvif::Error) -> &'static str {
     match error.to_string().as_str() {
         "Invalid camera address; enter a host or HTTP(S) URL" => {
             "Invalid camera address; enter a host or HTTP(S) URL."
@@ -81,8 +99,8 @@ fn connection_error(error: &onvif::Error) -> &'static str {
 pub fn open(
     parent: &adw::ApplicationWindow,
     source: Source,
-    on_save: impl Fn(Source) + 'static,
-    on_remove: impl Fn(u64) + 'static,
+    on_save: impl Fn(Source) -> mpsc::Receiver<Result<(), String>> + 'static,
+    on_remove: impl Fn(u64) -> mpsc::Receiver<Result<(), String>> + 'static,
 ) {
     let name = adw::EntryRow::builder().title("Name").build();
     name.set_text(&source.name);
@@ -167,8 +185,7 @@ pub fn open(
     let id = source.id;
     ui.remove.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
-            on_remove(id);
-            ui.window.close();
+            ui.finish_operation(on_remove(id));
         }
     });
     let weak = Rc::downgrade(&ui);
@@ -194,8 +211,7 @@ pub fn open(
             && updated.username == source.username
             && updated.password == source.password
         {
-            on_save(updated);
-            ui.window.close();
+            ui.finish_operation(on_save(updated));
             return;
         }
         let worker_address = updated.address.clone();
@@ -246,8 +262,7 @@ pub fn open(
                             .or_else(|| profiles.first())
                             .map(|profile| profile.token.clone()));
                     updated.profiles = profiles;
-                    on_save(updated);
-                    ui.window.close();
+                    ui.finish_operation(on_save(updated));
                     glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {

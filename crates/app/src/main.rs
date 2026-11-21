@@ -12,10 +12,96 @@ use adw::glib;
 use adw::gtk;
 use adw::prelude::*;
 use adw::{Application, ApplicationWindow};
-use storage::{MemoryStore, Source, SourceStore};
+use storage::{PersistentStore, Source, SourceStore};
 use tokio::sync::watch;
 
 const APP_ID: &str = "io.github.onvif_viewer.OnvifViewer";
+
+type StoreResult<T> = Result<T, String>;
+
+enum StoreRequest {
+    Load(mpsc::Sender<StoreResult<Vec<Source>>>),
+    Insert(Source, mpsc::Sender<StoreResult<()>>),
+    Update(Source, mpsc::Sender<StoreResult<()>>),
+    Remove(u64, mpsc::Sender<StoreResult<()>>),
+}
+
+fn start_store_worker() -> Option<mpsc::Sender<StoreRequest>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("camera-library".into())
+        .spawn(move || {
+            let mut store: Option<PersistentStore> = None;
+            while let Ok(request) = rx.recv() {
+                match request {
+                    StoreRequest::Load(reply) => {
+                        let result = (|| {
+                            if store.is_none() {
+                                store = Some(PersistentStore::open().map_err(|e| e.to_string())?);
+                            }
+                            store.as_ref().unwrap().list().map_err(|e| e.to_string())
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    StoreRequest::Insert(source, reply) => {
+                        let result = store.as_mut()
+                            .ok_or_else(|| "Camera library is not available. Retry loading it.".to_owned())
+                            .and_then(|store| store.insert(source).map_err(|e| e.to_string()));
+                        let _ = reply.send(result);
+                    }
+                    StoreRequest::Update(source, reply) => {
+                        let result = store.as_mut()
+                            .ok_or_else(|| "Camera library is not available. Retry loading it.".to_owned())
+                            .and_then(|store| store.update(source).map_err(|e| e.to_string()));
+                        let _ = reply.send(result);
+                    }
+                    StoreRequest::Remove(id, reply) => {
+                        let result = store.as_mut()
+                            .ok_or_else(|| "Camera library is not available. Retry loading it.".to_owned())
+                            .and_then(|store| store.remove(id).map_err(|e| e.to_string()));
+                        let _ = reply.send(result);
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some(tx)
+}
+
+fn await_store<T: 'static>(rx: mpsc::Receiver<StoreResult<T>>, callback: impl FnOnce(StoreResult<T>) + 'static) {
+    let mut callback = Some(callback);
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => Err("Camera library worker stopped. Restart the application and try again.".to_owned()),
+        };
+        callback.take().unwrap()(result);
+        glib::ControlFlow::Break
+    });
+}
+
+fn failed_operation(message: &str) -> mpsc::Receiver<StoreResult<()>> {
+    let (tx, rx) = mpsc::channel();
+    let _ = tx.send(Err(message.to_owned()));
+    rx
+}
+
+fn same_source(a: &Source, b: &Source) -> bool {
+    a.id == b.id
+        && a.name == b.name
+        && a.address == b.address
+        && a.username == b.username
+        && a.password == b.password
+        && a.model == b.model
+        && a.serial == b.serial
+        && a.selected_profile == b.selected_profile
+        && a.profiles.len() == b.profiles.len()
+        && a.profiles.iter().zip(&b.profiles).all(|(a, b)| {
+            a.token == b.token && a.name == b.name && a.width == b.width
+                && a.height == b.height && a.codec == b.codec && a.audio_codec == b.audio_codec
+        })
+}
 
 struct Library {
     window: glib::WeakRef<ApplicationWindow>,
@@ -23,21 +109,21 @@ struct Library {
     grid: gtk::FlowBox,
     toasts: adw::ToastOverlay,
     header_add: glib::WeakRef<gtk::Button>,
-    store: RefCell<Box<dyn SourceStore>>,
+    store: Option<mpsc::Sender<StoreRequest>>,
+    sources: RefCell<Vec<Source>>,
+    busy: Cell<bool>,
+    ready: Cell<bool>,
     feeds: RefCell<HashMap<u64, Vec<glib::WeakRef<adw::Window>>>>,
-    next_id: Cell<u64>,
+    next_id: Cell<Option<u64>>,
+    loading: Cell<bool>,
+    load_status: gtk::Label,
+    load_retry: gtk::Button,
+    empty_add: gtk::Button,
 }
 
 impl Library {
     fn refresh(self: &Rc<Self>) {
-        let sources = match self.store.borrow().list() {
-            Ok(sources) => sources,
-            Err(_) => {
-                self.toasts
-                    .add_toast(adw::Toast::new("Could not load cameras."));
-                return;
-            }
-        };
+        let sources = self.sources.borrow().clone();
         while let Some(child) = self.grid.first_child() {
             self.grid.remove(&child);
         }
@@ -104,21 +190,17 @@ impl Library {
                 let Some(parent) = library.window.upgrade() else {
                     return;
                 };
-                let weak_save = Rc::downgrade(&library);
-                let weak_remove = Rc::downgrade(&library);
+                if library.busy.get() || !library.ready.get() {
+                    library.toasts.add_toast(adw::Toast::new("Wait for the camera change to finish."));
+                    return;
+                }
+                let save_library = Rc::clone(&library);
+                let remove_library = Rc::clone(&library);
                 settings::open(
                     &parent,
                     camera.clone(),
-                    move |source| {
-                        if let Some(library) = weak_save.upgrade() {
-                            library.save_source(source);
-                        }
-                    },
-                    move |id| {
-                        if let Some(library) = weak_remove.upgrade() {
-                            library.remove_source(id);
-                        }
-                    },
+                    move |source| save_library.save_source(source),
+                    move |id| remove_library.remove_source(id),
                 );
             });
             let choices = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -143,7 +225,13 @@ impl Library {
                         if let Some(library) = weak.upgrade() {
                             let mut camera = camera.clone();
                             camera.selected_profile = Some(token.clone());
-                            library.save_source(camera);
+                            let rx = library.save_source(camera);
+                            let weak = Rc::downgrade(&library);
+                            await_store(rx, move |result| {
+                                if let (Err(error), Some(library)) = (result, weak.upgrade()) {
+                                    library.toasts.add_toast(adw::Toast::new(&error));
+                                }
+                            });
                         }
                     }
                 });
@@ -199,41 +287,163 @@ impl Library {
         }
     }
 
-    fn save_source(self: &Rc<Self>, source: Source) {
-        let result = self.store.borrow_mut().update(source.clone());
-        if result.is_err() {
-            self.toasts
-                .add_toast(adw::Toast::new("Could not update the camera."));
+    fn load(self: &Rc<Self>, done: impl FnOnce(StoreResult<()>) + 'static) {
+        if self.loading.replace(true) {
+            done(Err("Camera library is already loading. Try again.".to_owned()));
             return;
         }
-        if let Some(windows) = self.feeds.borrow_mut().get_mut(&source.id) {
-            windows.retain(|window| {
-                if let Some(window) = window.upgrade() {
-                    feed::change_profile(&window, source.clone());
-                    true
-                } else {
-                    false
-                }
-            });
+        self.ready.set(false);
+        self.stack.set_visible_child_name("loading");
+        self.empty_add.set_sensitive(false);
+        if let Some(button) = self.header_add.upgrade() {
+            button.set_sensitive(false);
+            button.set_visible(false);
+        }
+        self.load_retry.set_sensitive(false);
+        self.load_status.set_text("Loading camera library…");
+        let (tx, rx) = mpsc::channel();
+        if let Some(store) = &self.store {
+            let _ = store.send(StoreRequest::Load(tx));
         }
         let library = Rc::clone(self);
-        glib::idle_add_local_once(move || library.refresh());
-    }
-
-    fn remove_source(self: &Rc<Self>, id: u64) {
-        if self.store.borrow_mut().remove(id).is_err() {
-            self.toasts
-                .add_toast(adw::Toast::new("Could not remove the camera."));
-            return;
-        }
-        if let Some(windows) = self.feeds.borrow_mut().remove(&id) {
-            for window in windows {
-                if let Some(window) = window.upgrade() {
-                    window.close();
+        await_store(rx, move |result| {
+            library.loading.set(false);
+            match result {
+                Ok(sources) => {
+                    let loaded_next = sources.iter().map(|source| source.id).max()
+                        .unwrap_or(0).checked_add(1);
+                    library.next_id.set(match (library.next_id.get(), loaded_next) {
+                        (Some(current), Some(loaded)) => Some(current.max(loaded)),
+                        _ => None,
+                    });
+                    {
+                        let previous = library.sources.borrow();
+                        library.feeds.borrow_mut().retain(|id, windows| {
+                            let Some(source) = sources.iter().find(|source| source.id == *id) else {
+                                for window in windows.iter().filter_map(|window| window.upgrade()) {
+                                    window.close();
+                                }
+                                return false;
+                            };
+                            if previous.iter().find(|old| old.id == *id)
+                                .map_or(true, |old| !same_source(old, source))
+                            {
+                                windows.retain(|window| {
+                                    if let Some(window) = window.upgrade() {
+                                        feed::change_profile(&window, source.clone());
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                            }
+                            true
+                        });
+                    }
+                    *library.sources.borrow_mut() = sources;
+                    library.ready.set(true);
+                    library.empty_add.set_sensitive(true);
+                    if let Some(button) = library.header_add.upgrade() {
+                        button.set_sensitive(true);
+                    }
+                    library.refresh();
+                    done(Ok(()));
+                }
+                Err(error) => {
+                    library.load_status.set_text(&error);
+                    library.load_retry.set_sensitive(true);
+                    done(Err(error));
                 }
             }
+        });
+    }
+
+    fn mutate(
+        self: &Rc<Self>,
+        make_request: impl FnOnce(mpsc::Sender<StoreResult<()>>) -> StoreRequest,
+        success: impl FnOnce(&Rc<Self>) + 'static,
+    ) -> mpsc::Receiver<StoreResult<()>> {
+        if !self.ready.get() {
+            return failed_operation("Camera library is unavailable. Retry loading it; if a dialog is open, close it first.");
         }
-        self.refresh();
+        if self.busy.replace(true) {
+            return failed_operation("Wait for the camera change to finish, then try again.");
+        }
+        let (tx, rx) = mpsc::channel();
+        if let Some(store) = &self.store {
+            let _ = store.send(make_request(tx));
+        }
+        let (done, result) = mpsc::channel();
+        let library = Rc::clone(self);
+        await_store(rx, move |outcome| {
+            match outcome {
+                Ok(()) => {
+                    success(&library);
+                    library.busy.set(false);
+                    let _ = done.send(Ok(()));
+                }
+                Err(error) => {
+                    let after_load = Rc::clone(&library);
+                    library.load(move |reload| {
+                        after_load.busy.set(false);
+                        let message = match reload {
+                            Ok(()) => format!("{error}\n\nThe library was reloaded; check the camera before retrying."),
+                            Err(reload_error) => format!("{error}\n\nCould not reload the library: {reload_error}\nRetry loading it; if a dialog is open, close it first."),
+                        };
+                        let _ = done.send(Err(message));
+                    });
+                }
+            }
+        });
+        result
+    }
+
+    fn insert_source(self: &Rc<Self>, source: Source) -> mpsc::Receiver<StoreResult<()>> {
+        let saved = source.clone();
+        self.mutate(move |tx| StoreRequest::Insert(source, tx), move |library| {
+            library.sources.borrow_mut().push(saved);
+            library.refresh();
+        })
+    }
+
+    fn save_source(self: &Rc<Self>, source: Source) -> mpsc::Receiver<StoreResult<()>> {
+        if !self.sources.borrow().iter().any(|item| item.id == source.id) {
+            return failed_operation("This camera is no longer in the library. Close settings and check the library.");
+        }
+        let saved = source.clone();
+        self.mutate(move |tx| StoreRequest::Update(source, tx), move |library| {
+            if let Some(current) = library.sources.borrow_mut().iter_mut().find(|item| item.id == saved.id) {
+                *current = saved.clone();
+            }
+            if let Some(windows) = library.feeds.borrow_mut().get_mut(&saved.id) {
+                windows.retain(|window| {
+                    if let Some(window) = window.upgrade() {
+                        feed::change_profile(&window, saved.clone());
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            library.refresh();
+        })
+    }
+
+    fn remove_source(self: &Rc<Self>, id: u64) -> mpsc::Receiver<StoreResult<()>> {
+        if !self.sources.borrow().iter().any(|item| item.id == id) {
+            return failed_operation("This camera is no longer in the library. Close settings and check the library.");
+        }
+        self.mutate(move |tx| StoreRequest::Remove(id, tx), move |library| {
+            library.sources.borrow_mut().retain(|source| source.id != id);
+            if let Some(windows) = library.feeds.borrow_mut().remove(&id) {
+                for window in windows {
+                    if let Some(window) = window.upgrade() {
+                        window.close();
+                    }
+                }
+            }
+            library.refresh();
+        })
     }
 }
 
@@ -247,6 +457,7 @@ struct AddState {
     status: gtk::Label,
     spinner: gtk::Spinner,
     cancel: RefCell<Option<watch::Sender<bool>>>,
+    reserved_id: Cell<Option<u64>>,
     closed: Cell<bool>,
 }
 
@@ -322,6 +533,7 @@ fn add_camera(library: &Rc<Library>) {
         status,
         spinner,
         cancel: RefCell::new(None),
+        reserved_id: Cell::new(None),
         closed: Cell::new(false),
     });
     let weak = Rc::downgrade(&ui);
@@ -360,7 +572,7 @@ fn add_camera(library: &Rc<Library>) {
                                 let information = camera.information;
                                 let device_name = format!("{} {}", information.manufacturer, information.model).trim().to_owned();
                                 (device_name, information.model, information.serial_number, camera.profiles)
-                            }).map_err(|error| error.to_string())
+                            }).map_err(|error| settings::connection_error(&error).to_owned())
                         }
                     }
                 }),
@@ -387,9 +599,19 @@ fn add_camera(library: &Rc<Library>) {
             if ui.closed.get() { return glib::ControlFlow::Break; }
             match rx.try_recv() {
                 Ok(Ok((device_name, model, serial, profiles))) => {
-                    let id = library.next_id.get();
-                    library.next_id.set(id.wrapping_add(1));
-                    let result = library.store.borrow_mut().insert(Source {
+                    let id = if let Some(id) = ui.reserved_id.get() {
+                        id
+                    } else if let Some(id) = library.next_id.get() {
+                        library.next_id.set(id.checked_add(1));
+                        ui.reserved_id.set(Some(id));
+                        id
+                    } else {
+                        ui.show_error("No more camera IDs are available.");
+                        return glib::ControlFlow::Break;
+                    };
+                    ui.cancel.borrow_mut().take();
+                    ui.status.set_text("Saving camera library…");
+                    let source = Source {
                         id,
                         name: if name.is_empty() {
                             if device_name.is_empty() { "Camera".to_owned() } else { device_name }
@@ -401,13 +623,22 @@ fn add_camera(library: &Rc<Library>) {
                         serial: serial.clone(),
                         selected_profile: Source::default_profile(&profiles),
                         profiles: profiles.clone(),
+                    };
+                    let exists = library.sources.borrow().iter().any(|item| item.id == id);
+                    let result = if exists {
+                        library.save_source(source)
+                    } else {
+                        library.insert_source(source)
+                    };
+                    let weak_ui = Rc::downgrade(&ui);
+                    await_store(result, move |outcome| {
+                        let Some(ui) = weak_ui.upgrade() else { return };
+                        if ui.closed.get() { return; }
+                        match outcome {
+                            Ok(()) => ui.window.close(),
+                            Err(error) => ui.show_error(&error),
+                        }
                     });
-                    if result.is_err() {
-                        ui.show_error("Could not save the camera.");
-                        return glib::ControlFlow::Break;
-                    }
-                    library.refresh();
-                    ui.window.close();
                     glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {
@@ -451,6 +682,20 @@ fn build_ui(app: &Application) {
     empty_add.add_css_class("pill");
     empty_add.set_halign(gtk::Align::Center);
     empty.set_child(Some(&empty_add));
+    empty_add.set_sensitive(false);
+
+    let load_status = gtk::Label::new(Some("Loading camera library…"));
+    load_status.set_wrap(true);
+    load_status.set_max_width_chars(65);
+    let load_retry = gtk::Button::with_label("Retry");
+    load_retry.set_halign(gtk::Align::Center);
+    let load_body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    load_body.set_valign(gtk::Align::Center);
+    load_body.set_halign(gtk::Align::Center);
+    load_body.set_margin_start(24);
+    load_body.set_margin_end(24);
+    load_body.append(&load_status);
+    load_body.append(&load_retry);
 
     let grid = gtk::FlowBox::new();
     grid.set_selection_mode(gtk::SelectionMode::None);
@@ -464,9 +709,13 @@ fn build_ui(app: &Application) {
     grid.set_valign(gtk::Align::Start);
     let scroll = gtk::ScrolledWindow::builder().child(&grid).build();
     let stack = gtk::Stack::new();
+    stack.add_named(&load_body, Some("loading"));
+    stack.set_visible_child_name("loading");
     stack.add_named(&empty, Some("empty"));
     stack.add_named(&scroll, Some("sources"));
     let add = gtk::Button::with_label("Add Camera");
+    add.set_visible(false);
+    add.set_sensitive(false);
     let header = adw::HeaderBar::new();
     header.pack_start(&add);
     let menu = gtk::gio::Menu::new();
@@ -510,9 +759,16 @@ fn build_ui(app: &Application) {
         grid,
         toasts,
         header_add: add.downgrade(),
-        store: RefCell::new(Box::new(MemoryStore::default())),
+        store: start_store_worker(),
+        sources: RefCell::new(Vec::new()),
+        busy: Cell::new(false),
+        ready: Cell::new(false),
         feeds: RefCell::new(HashMap::new()),
-        next_id: Cell::new(1),
+        next_id: Cell::new(Some(1)),
+        loading: Cell::new(false),
+        load_status,
+        load_retry: load_retry.clone(),
+        empty_add: empty_add.clone(),
     });
     let strong = Rc::clone(&library);
     add.connect_clicked(move |_| add_camera(&strong));
@@ -522,6 +778,12 @@ fn build_ui(app: &Application) {
             add_camera(&library);
         }
     });
-    library.refresh();
+    let weak = Rc::downgrade(&library);
+    load_retry.connect_clicked(move |_| {
+        if let Some(library) = weak.upgrade() {
+            library.load(|_| {});
+        }
+    });
+    library.load(|_| {});
     window.present();
 }
