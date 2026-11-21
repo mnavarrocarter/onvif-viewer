@@ -16,7 +16,11 @@ const RTSP_LATENCY_MS: u32 = 500;
 const DROP_INDICATOR_DURATION: Duration = Duration::from_secs(5);
 
 enum Response {
-    Stream { uri: String, profile: String },
+    Stream {
+        uri: String,
+        profile: String,
+        token: String,
+    },
     Failed(String),
 }
 
@@ -24,6 +28,12 @@ enum Response {
 struct State {
     cancel: Option<watch::Sender<bool>>,
     responses: Option<Receiver<Response>>,
+    profile_token: Option<String>,
+    snapshot_cancel: Option<watch::Sender<bool>>,
+    snapshot_response: Option<Receiver<Result<onvif::Snapshot, String>>>,
+    snapshot_dialog: Option<gtk::FileChooserNative>,
+    snapshot_save: Option<gtk::gio::Cancellable>,
+    snapshot_generation: u64,
     closed: bool,
     player: Option<gst::Element>,
     last_drop: Option<Instant>,
@@ -36,6 +46,8 @@ struct Ui {
     status: gtk::Label,
     drop_indicator: gtk::Label,
     picture: gtk::Picture,
+    window: glib::WeakRef<adw::Window>,
+    snapshot_button: gtk::Button,
     state: RefCell<State>,
 }
 
@@ -55,7 +67,186 @@ fn stop_player(state: &mut State) {
 }
 
 impl Ui {
+    fn cancel_snapshot(&self) {
+        let (cancel, dialog, save) = {
+            let mut state = self.state.borrow_mut();
+            state.snapshot_generation = state.snapshot_generation.wrapping_add(1);
+            state.snapshot_response = None;
+            (
+                state.snapshot_cancel.take(),
+                state.snapshot_dialog.take(),
+                state.snapshot_save.take(),
+            )
+        };
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(true);
+        }
+        if let Some(dialog) = dialog {
+            dialog.hide();
+        }
+        if let Some(save) = save {
+            save.cancel();
+        }
+        self.snapshot_button.set_sensitive(false);
+    }
+
+    fn snapshot_error(&self, message: &str) {
+        if let Some(window) = self.window.upgrade() {
+            let dialog = adw::MessageDialog::new(
+                Some(&window),
+                Some("Could not save snapshot"),
+                Some(message),
+            );
+            dialog.add_response("close", "Close");
+            dialog.present();
+        }
+    }
+
+    fn capture(self: &Rc<Self>) {
+        let token = {
+            let state = self.state.borrow();
+            if state.closed
+                || state.snapshot_cancel.is_some()
+                || state.snapshot_dialog.is_some()
+                || state.snapshot_save.is_some()
+            {
+                return;
+            }
+            let Some(token) = state.profile_token.clone() else {
+                return;
+            };
+            token
+        };
+        let source = self.source.borrow();
+        let address = source.address.clone();
+        let username = source.username.clone();
+        let password = source.password.clone();
+        drop(source);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (response_tx, response_rx) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("onvif-snapshot".into())
+            .spawn(move || {
+                let result = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(async move {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_rx.changed() => None,
+                            result = async {
+                                let camera = onvif::connect(&address, &username, &password).await?;
+                                camera.snapshot(&token).await
+                            } => Some(result.map_err(|error| error.to_string())),
+                        }
+                    }),
+                    Err(error) => Some(Err(format!(
+                        "Could not initialize the camera connection: {error}"
+                    ))),
+                };
+                if let Some(result) = result {
+                    let _ = response_tx.send(result);
+                }
+            });
+        if let Err(error) = worker {
+            self.snapshot_error(&format!("Could not start the snapshot worker: {error}"));
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        state.snapshot_cancel = Some(cancel_tx);
+        state.snapshot_response = Some(response_rx);
+        self.snapshot_button.set_sensitive(false);
+    }
+
+    fn save_snapshot(self: &Rc<Self>, snapshot: onvif::Snapshot) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let extension = match snapshot.content_type.split(';').next().unwrap_or("").trim() {
+            "image/jpeg" => "jpg",
+            "image/png" => "png",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            "image/bmp" => "bmp",
+            "image/tiff" => "tiff",
+            _ => "img",
+        };
+        let name: String = self
+            .source
+            .borrow()
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let dialog = gtk::FileChooserNative::new(
+            Some("Save Snapshot"),
+            Some(&window),
+            gtk::FileChooserAction::Save,
+            Some("Save"),
+            Some("Cancel"),
+        );
+        dialog.set_modal(true);
+        dialog.set_current_name(&format!(
+            "{}-snapshot.{extension}",
+            if name.is_empty() { "camera" } else { &name }
+        ));
+        let generation = self.state.borrow().snapshot_generation;
+        let bytes = RefCell::new(Some(snapshot.bytes));
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(move |dialog, response| {
+            let Some(ui) = weak.upgrade() else { return };
+            {
+                let mut state = ui.state.borrow_mut();
+                if state.closed || state.snapshot_generation != generation {
+                    return;
+                }
+                state.snapshot_dialog = None;
+            }
+            if response == gtk::ResponseType::Accept {
+                if let (Some(file), Some(bytes)) = (dialog.file(), bytes.borrow_mut().take()) {
+                    let cancel = gtk::gio::Cancellable::new();
+                    ui.state.borrow_mut().snapshot_save = Some(cancel.clone());
+                    let weak = Rc::downgrade(&ui);
+                    file.replace_contents_async(
+                        bytes,
+                        None,
+                        false,
+                        gtk::gio::FileCreateFlags::NONE,
+                        Some(&cancel),
+                        move |result| {
+                            let Some(ui) = weak.upgrade() else { return };
+                            {
+                                let mut state = ui.state.borrow_mut();
+                                if state.closed || state.snapshot_generation != generation {
+                                    return;
+                                }
+                                state.snapshot_save = None;
+                            }
+                            ui.snapshot_button.set_sensitive(true);
+                            if let Err((_, error)) = result {
+                                ui.snapshot_error(&error.to_string());
+                            }
+                        },
+                    );
+                    return;
+                }
+                ui.snapshot_error("No destination was selected.");
+            }
+            ui.snapshot_button.set_sensitive(true);
+        });
+        self.state.borrow_mut().snapshot_dialog = Some(dialog.clone());
+        dialog.show();
+    }
+
     fn close(&self) {
+        self.cancel_snapshot();
         let mut state = self.state.borrow_mut();
         state.closed = true;
         if let Some(cancel) = state.cancel.take() {
@@ -133,6 +324,7 @@ impl Ui {
                         Ok(uri) => Response::Stream {
                             uri,
                             profile: profile.name.clone(),
+                            token: profile.token.clone(),
                         },
                         Err(error) => Response::Failed(error.to_string()),
                     };
@@ -216,7 +408,7 @@ impl Ui {
         Ok(())
     }
 
-    fn poll(&self) -> glib::ControlFlow {
+    fn poll(self: &Rc<Self>) -> glib::ControlFlow {
         if self.state.borrow().closed {
             return glib::ControlFlow::Break;
         }
@@ -228,7 +420,13 @@ impl Ui {
             Some(Ok(response)) => {
                 self.state.borrow_mut().responses = None;
                 match response {
-                    Response::Stream { uri, profile } => {
+                    Response::Stream {
+                        uri,
+                        profile,
+                        token,
+                    } => {
+                        self.state.borrow_mut().profile_token = Some(token);
+                        self.snapshot_button.set_sensitive(true);
                         self.title
                             .set_subtitle(&subtitle(&self.source.borrow().model, &profile));
                         match self.start_player(&uri) {
@@ -243,6 +441,34 @@ impl Ui {
                 self.state.borrow_mut().responses = None;
                 self.status
                     .set_text("Camera connection ended unexpectedly.");
+            }
+            _ => {}
+        }
+        let snapshot = {
+            let state = self.state.borrow();
+            state.snapshot_response.as_ref().map(Receiver::try_recv)
+        };
+        match snapshot {
+            Some(Ok(result)) => {
+                let mut state = self.state.borrow_mut();
+                state.snapshot_response = None;
+                state.snapshot_cancel = None;
+                drop(state);
+                match result {
+                    Ok(snapshot) => self.save_snapshot(snapshot),
+                    Err(error) => {
+                        self.snapshot_button.set_sensitive(true);
+                        self.snapshot_error(&error);
+                    }
+                }
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                let mut state = self.state.borrow_mut();
+                state.snapshot_response = None;
+                state.snapshot_cancel = None;
+                drop(state);
+                self.snapshot_button.set_sensitive(true);
+                self.snapshot_error("The snapshot worker ended unexpectedly.");
             }
             _ => {}
         }
@@ -392,6 +618,16 @@ pub fn open(parent: &adw::ApplicationWindow, source: Source) -> adw::Window {
     overlay.add_overlay(&status);
     let layout = adw::ToolbarView::new();
     layout.add_top_bar(&header);
+    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    toolbar.set_margin_top(6);
+    toolbar.set_margin_bottom(6);
+    toolbar.set_margin_start(6);
+    toolbar.set_margin_end(6);
+    let snapshot_button = gtk::Button::with_label("Take Snapshot");
+    snapshot_button.set_tooltip_text(Some("Take a snapshot"));
+    snapshot_button.set_sensitive(false);
+    toolbar.append(&snapshot_button);
+    layout.add_bottom_bar(&toolbar);
     layout.set_content(Some(&overlay));
     let window = adw::Window::builder()
         .transient_for(parent)
@@ -403,14 +639,23 @@ pub fn open(parent: &adw::ApplicationWindow, source: Source) -> adw::Window {
         .content(&layout)
         .build();
     let (_, header_height, _, _) = header.measure(gtk::Orientation::Vertical, video_width);
-    window.set_default_size(video_width, video_height + header_height);
+    let (_, toolbar_height, _, _) = toolbar.measure(gtk::Orientation::Vertical, video_width);
+    window.set_default_size(video_width, video_height + header_height + toolbar_height);
     let ui = Rc::new(Ui {
         source: RefCell::new(source),
         title,
         status,
         drop_indicator,
         picture,
+        window: window.downgrade(),
+        snapshot_button: snapshot_button.clone(),
         state: RefCell::new(State::default()),
+    });
+    let weak = Rc::downgrade(&ui);
+    snapshot_button.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.capture();
+        }
     });
     WINDOWS.with(|windows| {
         let mut windows = windows.borrow_mut();
@@ -445,6 +690,7 @@ pub fn change_profile(window: &adw::Window, source: Source) {
                 .then(|| ui.upgrade())
                 .flatten()
         }) {
+            ui.cancel_snapshot();
             {
                 let mut state = ui.state.borrow_mut();
                 if state.closed {
@@ -454,6 +700,7 @@ pub fn change_profile(window: &adw::Window, source: Source) {
                     let _ = cancel.send(true);
                 }
                 state.responses = None;
+                state.profile_token = None;
                 stop_player(&mut state);
             }
             ui.drop_indicator.set_visible(false);
