@@ -48,6 +48,11 @@ struct Ui {
     window: glib::WeakRef<adw::Window>,
     snapshot_button: gtk::Button,
     record_button: gtk::Button,
+    mute: gtk::ToggleButton,
+    volume: gtk::Scale,
+    choices: gtk::Box,
+    profile_popover: gtk::Popover,
+    on_select: Rc<dyn Fn(String)>,
     state: RefCell<State>,
 }
 
@@ -66,7 +71,7 @@ fn stop_player(state: &mut State) {
     }
 }
 
-fn capture_frame(player: &gst::Element) -> Result<Vec<u8>, &'static str> {
+pub(crate) fn capture_frame(player: &gst::Element) -> Result<Vec<u8>, &'static str> {
     let caps = gst::Caps::builder("image/jpeg").build();
     let sample = player
         .emit_by_name::<Option<gst::Sample>>("convert-sample", &[&caps])
@@ -97,7 +102,7 @@ fn suggested_filename(name: &str, kind: &str, extension: &str, timestamp: &str) 
     )
 }
 
-fn timestamped_filename(name: &str, kind: &str, extension: &str) -> String {
+pub(crate) fn timestamped_filename(name: &str, kind: &str, extension: &str) -> String {
     let timestamp = chrono::Local::now()
         .format("%Y-%m-%d_%H-%M-%S%.3f")
         .to_string();
@@ -119,19 +124,74 @@ impl Ui {
 
     fn update_record_button(&self) {
         let state = self.state.borrow();
-        if state.recording_starting {
-            self.record_button.set_label("Starting recording…");
-            self.record_button.set_sensitive(false);
+        let (icon, label, sensitive) = if state.recording_starting {
+            ("media-record-symbolic", "Starting recording", false)
         } else if state.recording_stopping {
-            self.record_button.set_label("Saving recording…");
-            self.record_button.set_sensitive(false);
+            ("media-record-symbolic", "Saving recording", false)
         } else if state.recording.is_some() {
-            self.record_button.set_label("Stop Recording");
-            self.record_button.set_sensitive(true);
+            ("media-playback-stop-symbolic", "Stop recording", true)
         } else {
-            self.record_button.set_label("Record Clip");
-            self.record_button
-                .set_sensitive(state.stream_uri.is_some() && !state.closed);
+            (
+                "media-record-symbolic",
+                "Record clip",
+                state.stream_uri.is_some() && !state.closed,
+            )
+        };
+        self.record_button.set_icon_name(icon);
+        self.record_button.set_tooltip_text(Some(label));
+        self.record_button.set_sensitive(sensitive);
+        if state.recording.is_some() {
+            self.record_button.add_css_class("recording");
+        } else {
+            self.record_button.remove_css_class("recording");
+        }
+    }
+
+    fn update_profiles(&self) {
+        while let Some(child) = self.choices.first_child() {
+            self.choices.remove(&child);
+        }
+        let source = self.source.borrow();
+        let selected = source
+            .selected_profile
+            .as_deref()
+            .and_then(|token| {
+                source
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.token == token)
+            })
+            .or_else(|| {
+                source.profiles.iter().find(|profile| {
+                    profile.codec.is_some() || profile.width.is_some() || profile.height.is_some()
+                })
+            })
+            .or_else(|| source.profiles.first());
+        for profile in &source.profiles {
+            let is_selected = selected.is_some_and(|selected| selected.token == profile.token);
+            let label = format!(
+                "{}  {}",
+                if is_selected { "✓" } else { " " },
+                Source::profile_label(profile)
+            );
+            let choice = gtk::Button::with_label(&label);
+            choice.add_css_class("flat");
+            let token = profile.token.clone();
+            let on_select = Rc::clone(&self.on_select);
+            let popover = self.profile_popover.downgrade();
+            choice.connect_clicked(move |_| {
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+                if !is_selected {
+                    on_select(token.clone());
+                }
+            });
+            self.choices.append(&choice);
+        }
+        if source.profiles.is_empty() {
+            self.choices
+                .append(&gtk::Label::new(Some("No profiles available")));
         }
     }
 
@@ -475,8 +535,8 @@ impl Ui {
         let player = gst::ElementFactory::make("playbin")
             .property("video-sink", &sink)
             .property("uri", uri.as_str())
-            .property("volume", 1.0_f64)
-            .property("mute", false)
+            .property("volume", self.volume.value())
+            .property("mute", self.mute.is_active())
             .build()
             .map_err(|_| "The GStreamer playback plugin is not installed.")?;
         player.connect("source-setup", false, move |values| {
@@ -726,7 +786,11 @@ fn initial_video_size(width: Option<u32>, height: Option<u32>) -> (i32, i32) {
     }
 }
 
-pub fn open(parent: &adw::ApplicationWindow, source: Source) -> adw::Window {
+pub fn open(
+    parent: &adw::ApplicationWindow,
+    source: Source,
+    on_select: impl Fn(String) + 'static,
+) -> adw::Window {
     let profile = source
         .selected_profile
         .as_ref()
@@ -773,20 +837,54 @@ pub fn open(parent: &adw::ApplicationWindow, source: Source) -> adw::Window {
     overlay.add_overlay(&status);
     let layout = adw::ToolbarView::new();
     layout.add_top_bar(&header);
-    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    toolbar.set_margin_top(6);
-    toolbar.set_margin_bottom(6);
-    toolbar.set_margin_start(6);
-    toolbar.set_margin_end(6);
-    let snapshot_button = gtk::Button::with_label("Take Snapshot");
-    snapshot_button.set_tooltip_text(Some("Take a snapshot"));
+    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    toolbar.add_css_class("grid-controls");
+    toolbar.set_halign(gtk::Align::Fill);
+    toolbar.set_valign(gtk::Align::End);
+    toolbar.set_margin_bottom(8);
+    toolbar.set_margin_start(8);
+    toolbar.set_margin_end(8);
+    let mute = gtk::ToggleButton::new();
+    mute.set_icon_name("audio-volume-high-symbolic");
+    mute.set_tooltip_text(Some("Mute"));
+    mute.add_css_class("flat");
+    mute.add_css_class("circular");
+    toolbar.append(&mute);
+    let volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
+    volume.set_value(1.0);
+    volume.set_draw_value(false);
+    volume.set_size_request(70, -1);
+    volume.set_hexpand(true);
+    volume.set_tooltip_text(Some("Volume"));
+    toolbar.append(&volume);
+    let choices = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    choices.set_margin_top(6);
+    choices.set_margin_bottom(6);
+    choices.set_margin_start(6);
+    choices.set_margin_end(6);
+    let profile_popover = gtk::Popover::new();
+    profile_popover.set_child(Some(&choices));
+    let profiles = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .popover(&profile_popover)
+        .tooltip_text("Select Profile")
+        .build();
+    profiles.add_css_class("flat");
+    profiles.add_css_class("circular");
+    toolbar.append(&profiles);
+    let snapshot_button = gtk::Button::from_icon_name("camera-photo-symbolic");
+    snapshot_button.set_tooltip_text(Some("Take snapshot"));
+    snapshot_button.add_css_class("flat");
+    snapshot_button.add_css_class("circular");
     snapshot_button.set_sensitive(false);
     toolbar.append(&snapshot_button);
-    let record_button = gtk::Button::with_label("Record Clip");
-    record_button.set_tooltip_text(Some("Record a clip to a local Matroska file"));
+    let record_button = gtk::Button::from_icon_name("media-record-symbolic");
+    record_button.set_tooltip_text(Some("Record clip"));
+    record_button.add_css_class("flat");
+    record_button.add_css_class("circular");
     record_button.set_sensitive(false);
     toolbar.append(&record_button);
-    layout.add_bottom_bar(&toolbar);
+    overlay.add_overlay(&toolbar);
     layout.set_content(Some(&overlay));
     let window = adw::Window::builder()
         .transient_for(parent)
@@ -798,8 +896,7 @@ pub fn open(parent: &adw::ApplicationWindow, source: Source) -> adw::Window {
         .content(&layout)
         .build();
     let (_, header_height, _, _) = header.measure(gtk::Orientation::Vertical, video_width);
-    let (_, toolbar_height, _, _) = toolbar.measure(gtk::Orientation::Vertical, video_width);
-    window.set_default_size(video_width, video_height + header_height + toolbar_height);
+    window.set_default_size(video_width, video_height + header_height);
     let ui = Rc::new(Ui {
         source: RefCell::new(source),
         title,
@@ -809,7 +906,37 @@ pub fn open(parent: &adw::ApplicationWindow, source: Source) -> adw::Window {
         window: window.downgrade(),
         snapshot_button: snapshot_button.clone(),
         record_button: record_button.clone(),
+        mute: mute.clone(),
+        volume: volume.clone(),
+        choices,
+        profile_popover,
+        on_select: Rc::new(on_select),
         state: RefCell::new(State::default()),
+    });
+    ui.update_profiles();
+    let weak = Rc::downgrade(&ui);
+    mute.connect_toggled(move |button| {
+        let muted = button.is_active();
+        let label = if muted { "Unmute" } else { "Mute" };
+        button.set_icon_name(if muted {
+            "audio-volume-muted-symbolic"
+        } else {
+            "audio-volume-high-symbolic"
+        });
+        button.set_tooltip_text(Some(label));
+        if let Some(ui) = weak.upgrade()
+            && let Some(player) = &ui.state.borrow().player
+        {
+            player.set_property("mute", muted);
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    volume.connect_value_changed(move |volume| {
+        if let Some(ui) = weak.upgrade()
+            && let Some(player) = &ui.state.borrow().player
+        {
+            player.set_property("volume", volume.value());
+        }
     });
     let weak = Rc::downgrade(&ui);
     snapshot_button.connect_clicked(move |_| {
@@ -894,6 +1021,7 @@ pub fn change_profile(window: &adw::Window, source: Source) {
                 profile.map_or("", |profile| &profile.name),
             ));
             *ui.source.borrow_mut() = source;
+            ui.update_profiles();
             ui.status.set_visible(true);
             ui.connect_camera();
         }
