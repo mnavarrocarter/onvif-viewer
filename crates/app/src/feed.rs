@@ -41,7 +41,7 @@ struct Ui {
 
 thread_local! {
     static WINDOWS: RefCell<Vec<(glib::WeakRef<adw::Window>, std::rc::Weak<Ui>)>> =
-        RefCell::new(Vec::new());
+        const { RefCell::new(Vec::new()) };
 }
 
 fn stop_player(state: &mut State) {
@@ -262,7 +262,8 @@ impl Ui {
                         break;
                     }
                     gst::MessageView::Element(element) => {
-                        if let Some(details) = element.structure().filter(|s| s.name() == "drop-msg")
+                        if let Some(details) =
+                            element.structure().filter(|s| s.name() == "drop-msg")
                         {
                             dropped += u64::from(details.get::<u32>("num-too-late").unwrap_or(0));
                             dropped +=
@@ -341,21 +342,6 @@ fn initial_video_size(width: Option<u32>, height: Option<u32>) -> (i32, i32) {
             ((width * MAX_HEIGHT + height / 2) / height).max(1) as i32,
             MAX_HEIGHT as i32,
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::initial_video_size;
-
-    #[test]
-    fn initial_video_size_fits_portrait_and_landscape_profiles() {
-        assert_eq!(initial_video_size(Some(2304), Some(1296)), (896, 504));
-        assert_eq!(initial_video_size(Some(720), Some(1280)), (315, 560));
-        assert_eq!(initial_video_size(Some(1000), Some(1000)), (560, 560));
-        assert_eq!(initial_video_size(Some(u32::MAX), Some(1)), (900, 1));
-        assert_eq!(initial_video_size(Some(0), Some(720)), (896, 504));
-        assert_eq!(initial_video_size(None, None), (896, 504));
     }
 }
 
@@ -499,4 +485,19 @@ pub fn change_profile(window: &adw::Window, source: Source) {
             ui.connect_camera();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial_video_size;
+
+    #[test]
+    fn initial_video_size_fits_portrait_and_landscape_profiles() {
+        assert_eq!(initial_video_size(Some(2304), Some(1296)), (896, 504));
+        assert_eq!(initial_video_size(Some(720), Some(1280)), (315, 560));
+        assert_eq!(initial_video_size(Some(1000), Some(1000)), (560, 560));
+        assert_eq!(initial_video_size(Some(u32::MAX), Some(1)), (900, 1));
+        assert_eq!(initial_video_size(Some(0), Some(720)), (896, 504));
+        assert_eq!(initial_video_size(None, None), (896, 504));
+    }
 }

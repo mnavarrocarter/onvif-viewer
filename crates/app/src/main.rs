@@ -44,20 +44,29 @@ fn start_store_worker() -> Option<mpsc::Sender<StoreRequest>> {
                         let _ = reply.send(result);
                     }
                     StoreRequest::Insert(source, reply) => {
-                        let result = store.as_mut()
-                            .ok_or_else(|| "Camera library is not available. Retry loading it.".to_owned())
+                        let result = store
+                            .as_mut()
+                            .ok_or_else(|| {
+                                "Camera library is not available. Retry loading it.".to_owned()
+                            })
                             .and_then(|store| store.insert(source).map_err(|e| e.to_string()));
                         let _ = reply.send(result);
                     }
                     StoreRequest::Update(source, reply) => {
-                        let result = store.as_mut()
-                            .ok_or_else(|| "Camera library is not available. Retry loading it.".to_owned())
+                        let result = store
+                            .as_mut()
+                            .ok_or_else(|| {
+                                "Camera library is not available. Retry loading it.".to_owned()
+                            })
                             .and_then(|store| store.update(source).map_err(|e| e.to_string()));
                         let _ = reply.send(result);
                     }
                     StoreRequest::Remove(id, reply) => {
-                        let result = store.as_mut()
-                            .ok_or_else(|| "Camera library is not available. Retry loading it.".to_owned())
+                        let result = store
+                            .as_mut()
+                            .ok_or_else(|| {
+                                "Camera library is not available. Retry loading it.".to_owned()
+                            })
                             .and_then(|store| store.remove(id).map_err(|e| e.to_string()));
                         let _ = reply.send(result);
                     }
@@ -68,13 +77,18 @@ fn start_store_worker() -> Option<mpsc::Sender<StoreRequest>> {
     Some(tx)
 }
 
-fn await_store<T: 'static>(rx: mpsc::Receiver<StoreResult<T>>, callback: impl FnOnce(StoreResult<T>) + 'static) {
+fn await_store<T: 'static>(
+    rx: mpsc::Receiver<StoreResult<T>>,
+    callback: impl FnOnce(StoreResult<T>) + 'static,
+) {
     let mut callback = Some(callback);
     glib::timeout_add_local(Duration::from_millis(50), move || {
         let result = match rx.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => Err("Camera library worker stopped. Restart the application and try again.".to_owned()),
+            Err(mpsc::TryRecvError::Disconnected) => Err(
+                "Camera library worker stopped. Restart the application and try again.".to_owned(),
+            ),
         };
         callback.take().unwrap()(result);
         glib::ControlFlow::Break
@@ -98,8 +112,12 @@ fn same_source(a: &Source, b: &Source) -> bool {
         && a.selected_profile == b.selected_profile
         && a.profiles.len() == b.profiles.len()
         && a.profiles.iter().zip(&b.profiles).all(|(a, b)| {
-            a.token == b.token && a.name == b.name && a.width == b.width
-                && a.height == b.height && a.codec == b.codec && a.audio_codec == b.audio_codec
+            a.token == b.token
+                && a.name == b.name
+                && a.width == b.width
+                && a.height == b.height
+                && a.codec == b.codec
+                && a.audio_codec == b.audio_codec
         })
 }
 
@@ -191,7 +209,9 @@ impl Library {
                     return;
                 };
                 if library.busy.get() || !library.ready.get() {
-                    library.toasts.add_toast(adw::Toast::new("Wait for the camera change to finish."));
+                    library
+                        .toasts
+                        .add_toast(adw::Toast::new("Wait for the camera change to finish."));
                     return;
                 }
                 let save_library = Rc::clone(&library);
@@ -221,18 +241,16 @@ impl Library {
                 let camera = source.clone();
                 let token = available.token.clone();
                 choice.connect_clicked(move |_| {
-                    if !selected {
-                        if let Some(library) = weak.upgrade() {
-                            let mut camera = camera.clone();
-                            camera.selected_profile = Some(token.clone());
-                            let rx = library.save_source(camera);
-                            let weak = Rc::downgrade(&library);
-                            await_store(rx, move |result| {
-                                if let (Err(error), Some(library)) = (result, weak.upgrade()) {
-                                    library.toasts.add_toast(adw::Toast::new(&error));
-                                }
-                            });
-                        }
+                    if !selected && let Some(library) = weak.upgrade() {
+                        let mut camera = camera.clone();
+                        camera.selected_profile = Some(token.clone());
+                        let rx = library.save_source(camera);
+                        let weak = Rc::downgrade(&library);
+                        await_store(rx, move |result| {
+                            if let (Err(error), Some(library)) = (result, weak.upgrade()) {
+                                library.toasts.add_toast(adw::Toast::new(&error));
+                            }
+                        });
                     }
                 });
                 choices.append(&choice);
@@ -289,7 +307,9 @@ impl Library {
 
     fn load(self: &Rc<Self>, done: impl FnOnce(StoreResult<()>) + 'static) {
         if self.loading.replace(true) {
-            done(Err("Camera library is already loading. Try again.".to_owned()));
+            done(Err(
+                "Camera library is already loading. Try again.".to_owned()
+            ));
             return;
         }
         self.ready.set(false);
@@ -310,23 +330,32 @@ impl Library {
             library.loading.set(false);
             match result {
                 Ok(sources) => {
-                    let loaded_next = sources.iter().map(|source| source.id).max()
-                        .unwrap_or(0).checked_add(1);
-                    library.next_id.set(match (library.next_id.get(), loaded_next) {
-                        (Some(current), Some(loaded)) => Some(current.max(loaded)),
-                        _ => None,
-                    });
+                    let loaded_next = sources
+                        .iter()
+                        .map(|source| source.id)
+                        .max()
+                        .unwrap_or(0)
+                        .checked_add(1);
+                    library
+                        .next_id
+                        .set(match (library.next_id.get(), loaded_next) {
+                            (Some(current), Some(loaded)) => Some(current.max(loaded)),
+                            _ => None,
+                        });
                     {
                         let previous = library.sources.borrow();
                         library.feeds.borrow_mut().retain(|id, windows| {
-                            let Some(source) = sources.iter().find(|source| source.id == *id) else {
+                            let Some(source) = sources.iter().find(|source| source.id == *id)
+                            else {
                                 for window in windows.iter().filter_map(|window| window.upgrade()) {
                                     window.close();
                                 }
                                 return false;
                             };
-                            if previous.iter().find(|old| old.id == *id)
-                                .map_or(true, |old| !same_source(old, source))
+                            if previous
+                                .iter()
+                                .find(|old| old.id == *id)
+                                .is_none_or(|old| !same_source(old, source))
                             {
                                 windows.retain(|window| {
                                     if let Some(window) = window.upgrade() {
@@ -364,7 +393,9 @@ impl Library {
         success: impl FnOnce(&Rc<Self>) + 'static,
     ) -> mpsc::Receiver<StoreResult<()>> {
         if !self.ready.get() {
-            return failed_operation("Camera library is unavailable. Retry loading it; if a dialog is open, close it first.");
+            return failed_operation(
+                "Camera library is unavailable. Retry loading it; if a dialog is open, close it first.",
+            );
         }
         if self.busy.replace(true) {
             return failed_operation("Wait for the camera change to finish, then try again.");
@@ -375,16 +406,15 @@ impl Library {
         }
         let (done, result) = mpsc::channel();
         let library = Rc::clone(self);
-        await_store(rx, move |outcome| {
-            match outcome {
-                Ok(()) => {
-                    success(&library);
-                    library.busy.set(false);
-                    let _ = done.send(Ok(()));
-                }
-                Err(error) => {
-                    let after_load = Rc::clone(&library);
-                    library.load(move |reload| {
+        await_store(rx, move |outcome| match outcome {
+            Ok(()) => {
+                success(&library);
+                library.busy.set(false);
+                let _ = done.send(Ok(()));
+            }
+            Err(error) => {
+                let after_load = Rc::clone(&library);
+                library.load(move |reload| {
                         after_load.busy.set(false);
                         let message = match reload {
                             Ok(()) => format!("{error}\n\nThe library was reloaded; check the camera before retrying."),
@@ -392,7 +422,6 @@ impl Library {
                         };
                         let _ = done.send(Err(message));
                     });
-                }
             }
         });
         result
@@ -400,50 +429,76 @@ impl Library {
 
     fn insert_source(self: &Rc<Self>, source: Source) -> mpsc::Receiver<StoreResult<()>> {
         let saved = source.clone();
-        self.mutate(move |tx| StoreRequest::Insert(source, tx), move |library| {
-            library.sources.borrow_mut().push(saved);
-            library.refresh();
-        })
+        self.mutate(
+            move |tx| StoreRequest::Insert(source, tx),
+            move |library| {
+                library.sources.borrow_mut().push(saved);
+                library.refresh();
+            },
+        )
     }
 
     fn save_source(self: &Rc<Self>, source: Source) -> mpsc::Receiver<StoreResult<()>> {
-        if !self.sources.borrow().iter().any(|item| item.id == source.id) {
-            return failed_operation("This camera is no longer in the library. Close settings and check the library.");
+        if !self
+            .sources
+            .borrow()
+            .iter()
+            .any(|item| item.id == source.id)
+        {
+            return failed_operation(
+                "This camera is no longer in the library. Close settings and check the library.",
+            );
         }
         let saved = source.clone();
-        self.mutate(move |tx| StoreRequest::Update(source, tx), move |library| {
-            if let Some(current) = library.sources.borrow_mut().iter_mut().find(|item| item.id == saved.id) {
-                *current = saved.clone();
-            }
-            if let Some(windows) = library.feeds.borrow_mut().get_mut(&saved.id) {
-                windows.retain(|window| {
-                    if let Some(window) = window.upgrade() {
-                        feed::change_profile(&window, saved.clone());
-                        true
-                    } else {
-                        false
-                    }
-                });
-            }
-            library.refresh();
-        })
+        self.mutate(
+            move |tx| StoreRequest::Update(source, tx),
+            move |library| {
+                if let Some(current) = library
+                    .sources
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|item| item.id == saved.id)
+                {
+                    *current = saved.clone();
+                }
+                if let Some(windows) = library.feeds.borrow_mut().get_mut(&saved.id) {
+                    windows.retain(|window| {
+                        if let Some(window) = window.upgrade() {
+                            feed::change_profile(&window, saved.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+                library.refresh();
+            },
+        )
     }
 
     fn remove_source(self: &Rc<Self>, id: u64) -> mpsc::Receiver<StoreResult<()>> {
         if !self.sources.borrow().iter().any(|item| item.id == id) {
-            return failed_operation("This camera is no longer in the library. Close settings and check the library.");
+            return failed_operation(
+                "This camera is no longer in the library. Close settings and check the library.",
+            );
         }
-        self.mutate(move |tx| StoreRequest::Remove(id, tx), move |library| {
-            library.sources.borrow_mut().retain(|source| source.id != id);
-            if let Some(windows) = library.feeds.borrow_mut().remove(&id) {
-                for window in windows {
-                    if let Some(window) = window.upgrade() {
-                        window.close();
+        self.mutate(
+            move |tx| StoreRequest::Remove(id, tx),
+            move |library| {
+                library
+                    .sources
+                    .borrow_mut()
+                    .retain(|source| source.id != id);
+                if let Some(windows) = library.feeds.borrow_mut().remove(&id) {
+                    for window in windows {
+                        if let Some(window) = window.upgrade() {
+                            window.close();
+                        }
                     }
                 }
-            }
-            library.refresh();
-        })
+                library.refresh();
+            },
+        )
     }
 }
 

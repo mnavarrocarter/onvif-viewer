@@ -106,7 +106,9 @@ trait Secrets: Send {
 struct KeyringSecrets;
 
 fn secret_error() -> StorageError {
-    error("Cannot access the password store. Unlock GNOME Keyring and check that Secret Service is running")
+    error(
+        "Cannot access the password store. Unlock GNOME Keyring and check that Secret Service is running",
+    )
 }
 
 fn error(message: &'static str) -> StorageError {
@@ -114,7 +116,9 @@ fn error(message: &'static str) -> StorageError {
 }
 
 fn database_error() -> StorageError {
-    error("Cannot access the camera library. Check the data directory permissions and available disk space")
+    error(
+        "Cannot access the camera library. Check the data directory permissions and available disk space",
+    )
 }
 
 impl KeyringSecrets {
@@ -133,7 +137,9 @@ impl Secrets for KeyringSecrets {
     }
 
     fn set(&self, key: &str, password: &str) -> Result<(), StorageError> {
-        Self::entry(key)?.set_password(password).map_err(|_| secret_error())
+        Self::entry(key)?
+            .set_password(password)
+            .map_err(|_| secret_error())
     }
 
     fn delete(&self, key: &str) -> Result<(), StorageError> {
@@ -156,7 +162,8 @@ impl PersistentStore {
             Some(path) => PathBuf::from(path),
             None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
                 error("Cannot locate the camera library. Set HOME or an absolute XDG_DATA_HOME")
-            })?).join(".local/share"),
+            })?)
+            .join(".local/share"),
         };
         Self::open_at(&base.join("onvif-viewer"), Box::new(KeyringSecrets))
     }
@@ -166,11 +173,15 @@ impl PersistentStore {
         let lock_path = dir.join("library.lock");
         let lock = Self::lock(&lock_path)?;
         let db = Connection::open(dir.join("library.sqlite3")).map_err(|_| database_error())?;
-        db.busy_timeout(Duration::from_secs(5)).map_err(|_| database_error())?;
-        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))
+        db.busy_timeout(Duration::from_secs(5))
+            .map_err(|_| database_error())?;
+        let version: i64 = db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|_| database_error())?;
         if version > 1 {
-            return Err(error("This camera library was created by a newer version. Update ONVIF Viewer"));
+            return Err(error(
+                "This camera library was created by a newer version. Update ONVIF Viewer",
+            ));
         }
         db.execute_batch(
             "BEGIN IMMEDIATE;
@@ -188,9 +199,14 @@ impl PersistentStore {
              CREATE TABLE IF NOT EXISTS secret_cleanup (secret_key TEXT PRIMARY KEY);
              PRAGMA user_version = 1;
              COMMIT;
-             PRAGMA foreign_keys = ON;"
-        ).map_err(|_| database_error())?;
-        let store = Self { db, lock_path, secrets };
+             PRAGMA foreign_keys = ON;",
+        )
+        .map_err(|_| database_error())?;
+        let store = Self {
+            db,
+            lock_path,
+            secrets,
+        };
         store.cleanup()?;
         drop(lock);
         Ok(store)
@@ -199,22 +215,32 @@ impl PersistentStore {
     // Every process uses the same advisory lock, including readers, so a secret
     // cannot be retired while another process is loading its source.
     fn lock(path: &Path) -> Result<File, StorageError> {
-        let file = OpenOptions::new().read(true).write(true).create(true)
-            .truncate(false).open(path).map_err(|_| database_error())?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|_| database_error())?;
         file.lock().map_err(|_| database_error())?;
         Ok(file)
     }
 
     fn cleanup(&self) -> Result<(), StorageError> {
-        let mut statement = self.db.prepare("SELECT secret_key FROM secret_cleanup")
+        let mut statement = self
+            .db
+            .prepare("SELECT secret_key FROM secret_cleanup")
             .map_err(|_| database_error())?;
-        let keys = statement.query_map([], |row| row.get::<_, String>(0))
+        let keys = statement
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(|_| database_error())?
-            .collect::<Result<Vec<_>, _>>().map_err(|_| database_error())?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| database_error())?;
         drop(statement);
         for key in keys {
             self.secrets.delete(&key)?;
-            self.db.execute("DELETE FROM secret_cleanup WHERE secret_key = ?1", [&key])
+            self.db
+                .execute("DELETE FROM secret_cleanup WHERE secret_key = ?1", [&key])
                 .map_err(|_| database_error())?;
         }
         Ok(())
@@ -229,14 +255,19 @@ impl PersistentStore {
             url::Url::parse(input)
         } else {
             url::Url::parse(&format!("http://{input}"))
-        }.map_err(|_| error("Invalid camera address; enter a host or HTTP(S) URL"))?;
+        }
+        .map_err(|_| error("Invalid camera address; enter a host or HTTP(S) URL"))?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err(error("Camera address must be a host or HTTP(S) URL"));
         }
-        if !url.username().is_empty() || url.password().is_some()
-            || url.query().is_some() || url.fragment().is_some()
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
         {
-            return Err(error("Remove credentials, query parameters, and fragments from the camera address"));
+            return Err(error(
+                "Remove credentials, query parameters, and fragments from the camera address",
+            ));
         }
         Ok(())
     }
@@ -246,20 +277,34 @@ impl PersistentStore {
         let _lock = Self::lock(&self.lock_path)?;
         self.cleanup()?;
         let id = source.id.to_string();
-        let old_key: Option<String> = self.db.query_row(
-            "SELECT secret_key FROM sources WHERE id = ?1", [&id], |row| row.get(0)
-        ).optional().map_err(|_| database_error())?;
+        let old_key: Option<String> = self
+            .db
+            .query_row(
+                "SELECT secret_key FROM sources WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| database_error())?;
         if update && old_key.is_none() {
-            return Err(error("Camera not found. Reload the camera library and try again"));
+            return Err(error(
+                "Camera not found. Reload the camera library and try again",
+            ));
         }
         if !update && old_key.is_some() {
-            return Err(error("Camera ID already exists. Reload the camera library and try again"));
+            return Err(error(
+                "Camera ID already exists. Reload the camera library and try again",
+            ));
         }
 
         let key = uuid::Uuid::new_v4().to_string();
         // Commit the intent before touching Secret Service. If the process stops
         // at any point, the next opener can safely delete this orphan.
-        self.db.execute("INSERT INTO secret_cleanup (secret_key) VALUES (?1)", [&key])
+        self.db
+            .execute(
+                "INSERT INTO secret_cleanup (secret_key) VALUES (?1)",
+                [&key],
+            )
             .map_err(|_| database_error())?;
         self.secrets.set(&key, &source.password)?;
         let tx = self.db.transaction().map_err(|_| database_error())?;
@@ -267,9 +312,18 @@ impl PersistentStore {
             tx.execute(
                 "UPDATE sources SET name=?2, address=?3, username=?4, model=?5, serial=?6,
                  selected_profile=?7, secret_key=?8 WHERE id=?1",
-                params![id, source.name, source.address, source.username, source.model,
-                    source.serial, source.selected_profile, key]
-            ).map_err(|_| database_error())?;
+                params![
+                    id,
+                    source.name,
+                    source.address,
+                    source.username,
+                    source.model,
+                    source.serial,
+                    source.selected_profile,
+                    key
+                ],
+            )
+            .map_err(|_| database_error())?;
             tx.execute("DELETE FROM profiles WHERE source_id=?1", [&id])
                 .map_err(|_| database_error())?;
         } else {
@@ -291,8 +345,11 @@ impl PersistentStore {
         tx.execute("DELETE FROM secret_cleanup WHERE secret_key=?1", [&key])
             .map_err(|_| database_error())?;
         if let Some(old_key) = old_key {
-            tx.execute("INSERT INTO secret_cleanup (secret_key) VALUES (?1)", [&old_key])
-                .map_err(|_| database_error())?;
+            tx.execute(
+                "INSERT INTO secret_cleanup (secret_key) VALUES (?1)",
+                [&old_key],
+            )
+            .map_err(|_| database_error())?;
         }
         tx.commit().map_err(|_| database_error())?;
         self.cleanup().map_err(|_| error(
@@ -309,11 +366,20 @@ impl SourceStore for PersistentStore {
         let mut statement = self.db.prepare(
             "SELECT id, name, address, username, model, serial, selected_profile, secret_key FROM sources"
         ).map_err(|_| database_error())?;
-        let rows = statement.query_map([], |row| Ok((
-            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
-            row.get::<_, Option<String>>(6)?, row.get::<_, String>(7)?
-        ))).map_err(|_| database_error())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|_| database_error())?;
         let mut sources = Vec::new();
         for row in rows {
             let (id, name, address, username, model, serial, selected_profile, key) =
@@ -325,14 +391,30 @@ impl SourceStore for PersistentStore {
             let mut profiles = self.db.prepare(
                 "SELECT token, name, width, height, codec, audio_codec FROM profiles WHERE source_id=?1 ORDER BY position"
             ).map_err(|_| database_error())?;
-            let profiles = profiles.query_map([&id], |row| Ok(onvif::Profile {
-                token: row.get(0)?, name: row.get(1)?, width: row.get(2)?,
-                height: row.get(3)?, codec: row.get(4)?, audio_codec: row.get(5)?,
-            })).map_err(|_| database_error())?
-                .collect::<Result<Vec<_>, _>>().map_err(|_| database_error())?;
+            let profiles = profiles
+                .query_map([&id], |row| {
+                    Ok(onvif::Profile {
+                        token: row.get(0)?,
+                        name: row.get(1)?,
+                        width: row.get(2)?,
+                        height: row.get(3)?,
+                        codec: row.get(4)?,
+                        audio_codec: row.get(5)?,
+                    })
+                })
+                .map_err(|_| database_error())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| database_error())?;
             sources.push(Source {
-                id: id.parse().map_err(|_| database_error())?, name, address, username,
-                password, model, serial, profiles, selected_profile,
+                id: id.parse().map_err(|_| database_error())?,
+                name,
+                address,
+                username,
+                password,
+                model,
+                serial,
+                profiles,
+                selected_profile,
             });
         }
         sources.sort_by_key(|source| source.id);
@@ -352,13 +434,20 @@ impl SourceStore for PersistentStore {
         self.cleanup()?;
         let tx = self.db.transaction().map_err(|_| database_error())?;
         let id = id.to_string();
-        let key: Option<String> = tx.query_row(
-            "SELECT secret_key FROM sources WHERE id=?1", [&id], |row| row.get(0)
-        ).optional().map_err(|_| database_error())?;
+        let key: Option<String> = tx
+            .query_row("SELECT secret_key FROM sources WHERE id=?1", [&id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|_| database_error())?;
         if let Some(key) = key {
-            tx.execute("INSERT INTO secret_cleanup (secret_key) VALUES (?1)", [&key])
+            tx.execute(
+                "INSERT INTO secret_cleanup (secret_key) VALUES (?1)",
+                [&key],
+            )
+            .map_err(|_| database_error())?;
+            tx.execute("DELETE FROM sources WHERE id=?1", [&id])
                 .map_err(|_| database_error())?;
-            tx.execute("DELETE FROM sources WHERE id=?1", [&id]).map_err(|_| database_error())?;
         }
         tx.commit().map_err(|_| database_error())?;
         self.cleanup().map_err(|_| error(
@@ -372,7 +461,10 @@ impl SourceStore for PersistentStore {
 mod tests {
     use super::{MemoryStore, Source, SourceStore};
     use super::{PersistentStore, Secrets, StorageError};
-    use std::{collections::HashMap, sync::{Arc, Mutex}};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     #[derive(Default)]
     struct FakeState {
@@ -388,20 +480,26 @@ mod tests {
     impl Secrets for FakeSecrets {
         fn get(&self, key: &str) -> Result<Option<String>, StorageError> {
             let state = self.0.lock().unwrap();
-            if state.fail_get { return Err(super::secret_error()); }
+            if state.fail_get {
+                return Err(super::secret_error());
+            }
             Ok(state.values.get(key).cloned())
         }
 
         fn set(&self, key: &str, value: &str) -> Result<(), StorageError> {
             let mut state = self.0.lock().unwrap();
             state.values.insert(key.into(), value.into());
-            if state.fail_set_after_write { return Err(super::secret_error()); }
+            if state.fail_set_after_write {
+                return Err(super::secret_error());
+            }
             Ok(())
         }
 
         fn delete(&self, key: &str) -> Result<(), StorageError> {
             let mut state = self.0.lock().unwrap();
-            if state.fail_delete { return Err(super::secret_error()); }
+            if state.fail_delete {
+                return Err(super::secret_error());
+            }
             state.values.remove(key);
             Ok(())
         }
@@ -418,16 +516,35 @@ mod tests {
         let mut store = persistent(dir.path(), &secrets);
         let mut camera = source(u64::MAX, "alice", "first unique password");
         camera.address = "camera.local:8080".into();
-        camera.profiles = vec![onvif::Profile {
-            token: "main".into(), name: "Main".into(), width: Some(1920),
-            height: Some(1080), codec: Some("H264".into()), audio_codec: Some("AAC".into()),
-        }, onvif::Profile {
-            token: "sub".into(), name: "Sub".into(), width: None, height: None,
-            codec: None, audio_codec: None,
-        }];
+        camera.profiles = vec![
+            onvif::Profile {
+                token: "main".into(),
+                name: "Main".into(),
+                width: Some(1920),
+                height: Some(1080),
+                codec: Some("H264".into()),
+                audio_codec: Some("AAC".into()),
+            },
+            onvif::Profile {
+                token: "sub".into(),
+                name: "Sub".into(),
+                width: None,
+                height: None,
+                codec: None,
+                audio_codec: None,
+            },
+        ];
         camera.selected_profile = Some("sub".into());
         store.insert(camera).unwrap();
-        let first_key = secrets.0.lock().unwrap().values.keys().next().unwrap().clone();
+        let first_key = secrets
+            .0
+            .lock()
+            .unwrap()
+            .values
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
         drop(store);
 
         let mut store = persistent(dir.path(), &secrets);
@@ -437,7 +554,10 @@ mod tests {
         assert_eq!(camera.address, "camera.local:8080");
         assert_eq!(camera.username, "alice");
         assert_eq!(camera.password, "first unique password");
-        assert_eq!((camera.model.as_str(), camera.serial.as_str()), ("Model", "Serial"));
+        assert_eq!(
+            (camera.model.as_str(), camera.serial.as_str()),
+            ("Model", "Serial")
+        );
         assert_eq!(camera.selected_profile.as_deref(), Some("sub"));
         assert_eq!(camera.profiles.len(), 2);
         assert_eq!(camera.profiles[0].width, Some(1920));
@@ -470,7 +590,11 @@ mod tests {
         let mut store = persistent(dir.path(), &secrets);
         store.insert(source(1, "user", "old")).unwrap();
         secrets.0.lock().unwrap().fail_set_after_write = true;
-        let err = store.update(source(1, "user", "new")).err().unwrap().to_string();
+        let err = store
+            .update(source(1, "user", "new"))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("Unlock GNOME Keyring"));
         assert!(!err.contains("new"));
         assert_eq!(secrets.0.lock().unwrap().values.len(), 2);
@@ -498,7 +622,11 @@ mod tests {
         let mut store = persistent(dir.path(), &secrets);
         store.insert(source(1, "user", "old")).unwrap();
         secrets.0.lock().unwrap().fail_delete = true;
-        let message = store.update(source(1, "user", "new")).err().unwrap().to_string();
+        let message = store
+            .update(source(1, "user", "new"))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(message.contains("was saved"));
         assert_eq!(secrets.0.lock().unwrap().values.len(), 2);
         drop(store);
@@ -522,10 +650,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let secrets = FakeSecrets::default();
         let mut store = persistent(dir.path(), &secrets);
-        store.db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+        store
+            .db
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
         for address in [
-            "http://user:password@camera/", "camera/?password=hidden",
-            "https://camera/#password", "http://camera/?", "camera/#", "ftp://camera/",
+            "http://user:password@camera/",
+            "camera/?password=hidden",
+            "https://camera/#password",
+            "http://camera/?",
+            "camera/#",
+            "ftp://camera/",
         ] {
             let mut camera = source(1, "user", "secret-password");
             camera.address = address.into();
@@ -535,10 +670,16 @@ mod tests {
         }
         assert!(secrets.0.lock().unwrap().values.is_empty());
         store.insert(source(1, "user", "secret-password")).unwrap();
-        store.update(source(1, "user", "other-secret-password")).unwrap();
+        store
+            .update(source(1, "user", "other-secret-password"))
+            .unwrap();
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let bytes = std::fs::read(entry.unwrap().path()).unwrap();
-            assert!(!bytes.windows(b"secret-password".len()).any(|w| w == b"secret-password"));
+            assert!(
+                !bytes
+                    .windows(b"secret-password".len())
+                    .any(|w| w == b"secret-password")
+            );
         }
     }
 
@@ -554,14 +695,20 @@ mod tests {
         assert_eq!(secrets.0.lock().unwrap().values.len(), 2);
         assert_eq!(first.list().unwrap()[0].password, "one");
         assert_eq!(second.list().unwrap()[0].password, "two");
-        let old_key: String = first.db.query_row(
-            "SELECT secret_key FROM sources WHERE id='1'", [], |row| row.get(0)
-        ).unwrap();
+        let old_key: String = first
+            .db
+            .query_row("SELECT secret_key FROM sources WHERE id='1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         first.remove(1).unwrap();
         first.insert(source(1, "first", "three")).unwrap();
-        let new_key: String = first.db.query_row(
-            "SELECT secret_key FROM sources WHERE id='1'", [], |row| row.get(0)
-        ).unwrap();
+        let new_key: String = first
+            .db
+            .query_row("SELECT secret_key FROM sources WHERE id='1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_ne!(old_key, new_key);
         assert_eq!(second.list().unwrap()[0].password, "two");
         assert!(first.insert(source(1, "duplicate", "unused")).is_err());
