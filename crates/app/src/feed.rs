@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use adw::{glib, gtk};
@@ -10,6 +10,10 @@ use gstreamer as gst;
 use tokio::sync::watch;
 
 use crate::storage::Source;
+
+// Keep the RTSP jitter buffer bounded without forcing sinks to run unsynchronized.
+const RTSP_LATENCY_MS: u32 = 500;
+const DROP_INDICATOR_DURATION: Duration = Duration::from_secs(5);
 
 enum Response {
     Stream { uri: String, profile: String },
@@ -22,12 +26,15 @@ struct State {
     responses: Option<Receiver<Response>>,
     closed: bool,
     player: Option<gst::Element>,
+    last_drop: Option<Instant>,
+    dropped_packets: u64,
 }
 
 struct Ui {
     source: RefCell<Source>,
     title: adw::WindowTitle,
     status: gtk::Label,
+    drop_indicator: gtk::Label,
     picture: gtk::Picture,
     state: RefCell<State>,
 }
@@ -39,6 +46,8 @@ thread_local! {
 
 fn stop_player(state: &mut State) {
     if let Some(player) = state.player.take() {
+        state.last_drop = None;
+        state.dropped_packets = 0;
         std::thread::spawn(move || {
             let _ = player.set_state(gst::State::Null);
         });
@@ -54,6 +63,7 @@ impl Ui {
         }
         state.responses = None;
         stop_player(&mut state);
+        self.drop_indicator.set_visible(false);
         self.picture.set_paintable(gtk::gdk::Paintable::NONE);
     }
 
@@ -167,6 +177,24 @@ impl Ui {
             .map_err(|_| "The GStreamer playback plugin is not installed.")?;
         player.connect("source-setup", false, move |values| {
             if let Ok(source) = values[1].get::<gst::Element>() {
+                if source
+                    .factory()
+                    .is_some_and(|factory| factory.name() == "rtspsrc")
+                {
+                    source.set_property("latency", RTSP_LATENCY_MS);
+                    source.set_property("drop-on-latency", true);
+                    source.connect("new-manager", false, |values| {
+                        if let Ok(manager) = values[1].get::<gst::Element>() {
+                            manager.connect("new-jitterbuffer", false, |values| {
+                                if let Ok(buffer) = values[1].get::<gst::Element>() {
+                                    buffer.set_property("post-drop-messages", true);
+                                }
+                                None
+                            });
+                        }
+                        None
+                    });
+                }
                 if source.find_property("user-id").is_some()
                     && source.find_property("user-pw").is_some()
                 {
@@ -218,24 +246,51 @@ impl Ui {
             }
             _ => {}
         }
-        let failed = {
-            let state = self.state.borrow();
-            state
-                .player
-                .as_ref()
-                .and_then(|player| player.bus())
-                .is_some_and(|bus| {
-                    while let Some(message) = bus.pop() {
-                        if matches!(
-                            message.view(),
-                            gst::MessageView::Error(_) | gst::MessageView::Eos(_)
-                        ) {
-                            return true;
+        let mut failed = false;
+        let mut dropped = 0_u64;
+        if let Some(bus) = self
+            .state
+            .borrow()
+            .player
+            .as_ref()
+            .and_then(|player| player.bus())
+        {
+            while let Some(message) = bus.pop() {
+                match message.view() {
+                    gst::MessageView::Error(_) | gst::MessageView::Eos(_) => {
+                        failed = true;
+                        break;
+                    }
+                    gst::MessageView::Element(element) => {
+                        if let Some(details) = element.structure().filter(|s| s.name() == "drop-msg")
+                        {
+                            dropped += u64::from(details.get::<u32>("num-too-late").unwrap_or(0));
+                            dropped +=
+                                u64::from(details.get::<u32>("num-drop-on-latency").unwrap_or(0));
                         }
                     }
-                    false
-                })
-        };
+                    _ => {}
+                }
+            }
+        }
+        let now = Instant::now();
+        let mut state = self.state.borrow_mut();
+        if state
+            .last_drop
+            .is_some_and(|last| now.duration_since(last) >= DROP_INDICATOR_DURATION)
+        {
+            state.last_drop = None;
+            state.dropped_packets = 0;
+        }
+        if dropped > 0 {
+            state.last_drop = Some(now);
+            state.dropped_packets = state.dropped_packets.saturating_add(dropped);
+            self.drop_indicator
+                .set_label(&format!("Packets dropped: {}", state.dropped_packets));
+        }
+        self.drop_indicator
+            .set_visible(state.last_drop.is_some() && !failed);
+        drop(state);
         if failed {
             stop_player(&mut self.state.borrow_mut());
             self.picture.set_paintable(gtk::gdk::Paintable::NONE);
@@ -330,6 +385,12 @@ pub fn open(parent: &adw::ApplicationWindow, source: Source) -> adw::Window {
     );
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&title));
+    let drop_indicator = gtk::Label::new(None);
+    drop_indicator.set_visible(false);
+    drop_indicator.set_tooltip_text(Some(
+        "RTP packets reported dropped by the jitter buffer; this does not measure camera delay.",
+    ));
+    header.pack_end(&drop_indicator);
     let picture = gtk::Picture::new();
     picture.set_can_shrink(true);
     picture.set_keep_aspect_ratio(true);
@@ -361,6 +422,7 @@ pub fn open(parent: &adw::ApplicationWindow, source: Source) -> adw::Window {
         source: RefCell::new(source),
         title,
         status,
+        drop_indicator,
         picture,
         state: RefCell::new(State::default()),
     });
@@ -408,6 +470,7 @@ pub fn change_profile(window: &adw::Window, source: Source) {
                 state.responses = None;
                 stop_player(&mut state);
             }
+            ui.drop_indicator.set_visible(false);
             ui.picture.set_paintable(gtk::gdk::Paintable::NONE);
             let profile = source
                 .selected_profile
