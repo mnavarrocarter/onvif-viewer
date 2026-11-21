@@ -34,6 +34,8 @@ cargo run
 
 Select **Add Camera**, then enter its ONVIF device service URL including its port, username, and password. Select a camera tile to open its feed. Use the tile's settings button to edit or remove the camera, and its profile menu to choose a stream; changing the profile also switches any open feeds.
 
+In a feed window, use **Take Snapshot** in the bottom toolbar to request a still image from the camera and choose where to save it. The snapshot uses the selected ONVIF media profile and may differ from the live video in resolution or timing. Capture and file errors are shown in the window.
+
 Camera tiles and newly opened feed windows use the selected profile's aspect ratio when its dimensions are known. On Wayland, the compositor controls interactive window resizing, so the window itself cannot be locked to that ratio; the video remains undistorted and is letterboxed when necessary.
 
 RTSP playback uses a 500 ms jitter buffer and drops packets when that buffer fills, rather than letting it grow without limit. This favors staying near live over uninterrupted playback: unstable networks can cause stutter, missing audio, or video artifacts until the next keyframe. GStreamer continues to synchronize audio and video. This bounds the RTSP jitter buffer, not total end-to-end delay; camera-side buffering, transport delays, decoding, and clock drift can still affect playback.
