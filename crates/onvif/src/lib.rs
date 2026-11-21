@@ -270,12 +270,12 @@ async fn request(
     }
     let text = String::from_utf8(bytes)
         .map_err(|_| error("Camera returned a response that is not UTF-8 XML"))?;
-    if let Ok(doc) = Document::parse(&text) {
-        if doc.descendants().any(|n| n.has_tag_name((SOAP, "Fault"))) {
-            return Err(error(
-                "Camera returned an ONVIF fault; check credentials, camera clock, and service support",
-            ));
-        }
+    if let Ok(doc) = Document::parse(&text)
+        && doc.descendants().any(|n| n.has_tag_name((SOAP, "Fault")))
+    {
+        return Err(error(
+            "Camera returned an ONVIF fault; check credentials, camera clock, and service support",
+        ));
     }
     if !status.is_success() {
         return Err(Error(format!(
