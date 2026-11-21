@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 gstreamer = "0.25"
+
+[dev-dependencies]
+tempfile = "3"

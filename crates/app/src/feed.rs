@@ -16,11 +16,7 @@ const RTSP_LATENCY_MS: u32 = 500;
 const DROP_INDICATOR_DURATION: Duration = Duration::from_secs(5);
 
 enum Response {
-    Stream {
-        uri: String,
-        profile: String,
-        token: String,
-    },
+    Stream { uri: String, profile: String },
     Failed(String),
 }
 
@@ -28,9 +24,7 @@ enum Response {
 struct State {
     cancel: Option<watch::Sender<bool>>,
     responses: Option<Receiver<Response>>,
-    profile_token: Option<String>,
-    snapshot_cancel: Option<watch::Sender<bool>>,
-    snapshot_response: Option<Receiver<Result<onvif::Snapshot, String>>>,
+    snapshot_response: Option<Receiver<Result<Vec<u8>, &'static str>>>,
     snapshot_dialog: Option<gtk::FileChooserNative>,
     snapshot_save: Option<gtk::gio::Cancellable>,
     snapshot_generation: u64,
@@ -70,6 +64,44 @@ fn stop_player(state: &mut State) {
             let _ = player.set_state(gst::State::Null);
         });
     }
+}
+
+fn capture_frame(player: &gst::Element) -> Result<Vec<u8>, &'static str> {
+    let caps = gst::Caps::builder("image/jpeg").build();
+    let sample = player
+        .emit_by_name::<Option<gst::Sample>>("convert-sample", &[&caps])
+        .ok_or("No video frame is available, or the GStreamer JPEG encoder is missing.")?;
+    let buffer = sample
+        .buffer()
+        .ok_or("The captured video frame is empty.")?;
+    let map = buffer
+        .map_readable()
+        .map_err(|_| "Could not read the captured video frame.")?;
+    Ok(map.as_slice().to_vec())
+}
+
+fn suggested_filename(name: &str, kind: &str, extension: &str, timestamp: &str) -> String {
+    let stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!(
+        "{}-{kind}-{timestamp}.{extension}",
+        if stem.is_empty() { "camera" } else { &stem }
+    )
+}
+
+fn timestamped_filename(name: &str, kind: &str, extension: &str) -> String {
+    let timestamp = chrono::Local::now()
+        .format("%Y-%m-%d_%H-%M-%S%.3f")
+        .to_string();
+    suggested_filename(name, kind, extension, &timestamp)
 }
 
 impl Ui {
@@ -154,7 +186,11 @@ impl Ui {
             Some("Cancel"),
         );
         dialog.set_modal(true);
-        dialog.set_current_name(&recording::default_filename(&self.source.borrow().name));
+        dialog.set_current_name(&timestamped_filename(
+            &self.source.borrow().name,
+            "recording",
+            "mkv",
+        ));
         let weak = Rc::downgrade(self);
         dialog.connect_response(move |dialog, response| {
             let Some(ui) = weak.upgrade() else { return };
@@ -184,19 +220,12 @@ impl Ui {
     }
 
     fn cancel_snapshot(&self) {
-        let (cancel, dialog, save) = {
+        let (dialog, save) = {
             let mut state = self.state.borrow_mut();
             state.snapshot_generation = state.snapshot_generation.wrapping_add(1);
             state.snapshot_response = None;
-            (
-                state.snapshot_cancel.take(),
-                state.snapshot_dialog.take(),
-                state.snapshot_save.take(),
-            )
+            (state.snapshot_dialog.take(), state.snapshot_save.take())
         };
-        if let Some(cancel) = cancel {
-            let _ = cancel.send(true);
-        }
         if let Some(dialog) = dialog {
             dialog.hide();
         }
@@ -214,92 +243,54 @@ impl Ui {
         }
     }
 
+    fn update_snapshot_button(&self) {
+        let state = self.state.borrow();
+        self.snapshot_button.set_sensitive(
+            !state.closed
+                && state.player.is_some()
+                && state.snapshot_response.is_none()
+                && state.snapshot_dialog.is_none()
+                && state.snapshot_save.is_none(),
+        );
+    }
+
     fn capture(self: &Rc<Self>) {
-        let token = {
+        let player = {
             let state = self.state.borrow();
             if state.closed
-                || state.snapshot_cancel.is_some()
+                || state.snapshot_response.is_some()
                 || state.snapshot_dialog.is_some()
                 || state.snapshot_save.is_some()
             {
                 return;
             }
-            let Some(token) = state.profile_token.clone() else {
+            let Some(player) = state.player.clone() else {
                 return;
             };
-            token
+            player
         };
-        let source = self.source.borrow();
-        let address = source.address.clone();
-        let username = source.username.clone();
-        let password = source.password.clone();
-        drop(source);
-        let (cancel_tx, mut cancel_rx) = watch::channel(false);
         let (response_tx, response_rx) = mpsc::channel();
-        let worker = std::thread::Builder::new()
-            .name("onvif-snapshot".into())
+        if std::thread::Builder::new()
+            .name("snapshot-encoder".into())
             .spawn(move || {
-                let result = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime.block_on(async move {
-                        tokio::select! {
-                            biased;
-                            _ = cancel_rx.changed() => None,
-                            result = async {
-                                let camera = onvif::connect(&address, &username, &password).await?;
-                                camera.snapshot(&token).await
-                            } => Some(result.map_err(|error| error.to_string())),
-                        }
-                    }),
-                    Err(error) => Some(Err(format!(
-                        "Could not initialize the camera connection: {error}"
-                    ))),
-                };
-                if let Some(result) = result {
-                    let _ = response_tx.send(result);
-                }
-            });
-        if let Err(error) = worker {
+                let _ = response_tx.send(capture_frame(&player));
+            })
+            .is_err()
+        {
             self.snapshot_error(
                 "Could not capture snapshot",
-                &format!("Could not start the snapshot worker: {error}"),
+                "Could not start the snapshot worker.",
             );
             return;
         }
-        let mut state = self.state.borrow_mut();
-        state.snapshot_cancel = Some(cancel_tx);
-        state.snapshot_response = Some(response_rx);
-        self.snapshot_button.set_sensitive(false);
+        self.state.borrow_mut().snapshot_response = Some(response_rx);
+        self.update_snapshot_button();
     }
 
-    fn save_snapshot(self: &Rc<Self>, snapshot: onvif::Snapshot) {
+    fn save_snapshot(self: &Rc<Self>, bytes: Vec<u8>) {
         let Some(window) = self.window.upgrade() else {
             return;
         };
-        let extension = match snapshot.content_type.split(';').next().unwrap_or("").trim() {
-            "image/jpeg" => "jpg",
-            "image/png" => "png",
-            "image/webp" => "webp",
-            "image/gif" => "gif",
-            "image/bmp" => "bmp",
-            "image/tiff" => "tiff",
-            _ => "img",
-        };
-        let name: String = self
-            .source
-            .borrow()
-            .name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
         let dialog = gtk::FileChooserNative::new(
             Some("Save Snapshot"),
             Some(&window),
@@ -308,12 +299,13 @@ impl Ui {
             Some("Cancel"),
         );
         dialog.set_modal(true);
-        dialog.set_current_name(&format!(
-            "{}-snapshot.{extension}",
-            if name.is_empty() { "camera" } else { &name }
+        dialog.set_current_name(&timestamped_filename(
+            &self.source.borrow().name,
+            "snapshot",
+            "jpg",
         ));
         let generation = self.state.borrow().snapshot_generation;
-        let bytes = RefCell::new(Some(snapshot.bytes));
+        let bytes = RefCell::new(Some(bytes));
         let weak = Rc::downgrade(self);
         dialog.connect_response(move |dialog, response| {
             let Some(ui) = weak.upgrade() else { return };
@@ -344,7 +336,7 @@ impl Ui {
                                 }
                                 state.snapshot_save = None;
                             }
-                            ui.snapshot_button.set_sensitive(true);
+                            ui.update_snapshot_button();
                             if let Err((_, error)) = result {
                                 ui.snapshot_error("Could not save snapshot", &error.to_string());
                             }
@@ -354,7 +346,7 @@ impl Ui {
                 }
                 ui.snapshot_error("Could not save snapshot", "No destination was selected.");
             }
-            ui.snapshot_button.set_sensitive(true);
+            ui.update_snapshot_button();
         });
         self.state.borrow_mut().snapshot_dialog = Some(dialog.clone());
         dialog.show();
@@ -445,7 +437,6 @@ impl Ui {
                         Ok(uri) => Response::Stream {
                             uri,
                             profile: profile.name.clone(),
-                            token: profile.token.clone(),
                         },
                         Err(error) => Response::Failed(error.to_string()),
                     };
@@ -541,21 +532,18 @@ impl Ui {
             Some(Ok(response)) => {
                 self.state.borrow_mut().responses = None;
                 match response {
-                    Response::Stream {
-                        uri,
-                        profile,
-                        token,
-                    } => {
+                    Response::Stream { uri, profile } => {
                         let mut state = self.state.borrow_mut();
-                        state.profile_token = Some(token);
                         state.stream_uri = Some(uri.clone());
                         drop(state);
-                        self.snapshot_button.set_sensitive(true);
                         self.update_record_button();
                         self.title
                             .set_subtitle(&subtitle(&self.source.borrow().model, &profile));
                         match self.start_player(&uri) {
-                            Ok(()) => self.status.set_visible(false),
+                            Ok(()) => {
+                                self.status.set_visible(false);
+                                self.update_snapshot_button();
+                            }
                             Err(message) => self.status.set_text(message),
                         }
                     }
@@ -577,22 +565,20 @@ impl Ui {
             Some(Ok(result)) => {
                 let mut state = self.state.borrow_mut();
                 state.snapshot_response = None;
-                state.snapshot_cancel = None;
                 drop(state);
                 match result {
                     Ok(snapshot) => self.save_snapshot(snapshot),
                     Err(error) => {
-                        self.snapshot_button.set_sensitive(true);
-                        self.snapshot_error("Could not capture snapshot", &error);
+                        self.update_snapshot_button();
+                        self.snapshot_error("Could not capture snapshot", error);
                     }
                 }
             }
             Some(Err(TryRecvError::Disconnected)) => {
                 let mut state = self.state.borrow_mut();
                 state.snapshot_response = None;
-                state.snapshot_cancel = None;
                 drop(state);
-                self.snapshot_button.set_sensitive(true);
+                self.update_snapshot_button();
                 self.snapshot_error(
                     "Could not capture snapshot",
                     "The snapshot worker ended unexpectedly.",
@@ -687,6 +673,7 @@ impl Ui {
             .set_visible(state.last_drop.is_some() && !failed);
         drop(state);
         if failed {
+            self.cancel_snapshot();
             stop_player(&mut self.state.borrow_mut());
             self.picture.set_paintable(gtk::gdk::Paintable::NONE);
             self.status.set_text(
@@ -879,7 +866,6 @@ pub fn change_profile(window: &adw::Window, source: Source) {
                     let _ = cancel.send(true);
                 }
                 state.responses = None;
-                state.profile_token = None;
                 state.stream_uri = None;
                 stop_player(&mut state);
             }
@@ -916,7 +902,73 @@ pub fn change_profile(window: &adw::Window, source: Source) {
 
 #[cfg(test)]
 mod tests {
-    use super::initial_video_size;
+    use super::{capture_frame, initial_video_size, suggested_filename};
+    use gst::prelude::*;
+    use gstreamer as gst;
+
+    #[test]
+    fn captures_decoded_frame_as_jpeg() {
+        gst::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.avi");
+        let generator = gst::parse::launch(
+            "videotestsrc num-buffers=10 ! video/x-raw,width=64,height=48,framerate=10/1 ! jpegenc ! avimux ! filesink name=output",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        generator
+            .by_name("output")
+            .unwrap()
+            .set_property("location", path.to_str().unwrap());
+        generator.set_state(gst::State::Playing).unwrap();
+        let message = generator
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .expect("video generation timed out");
+        assert!(
+            matches!(message.view(), gst::MessageView::Eos(_)),
+            "{message:?}"
+        );
+        generator.set_state(gst::State::Null).unwrap();
+
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let player = gst::ElementFactory::make("playbin")
+            .property("uri", url::Url::from_file_path(path).unwrap().as_str())
+            .property("video-sink", sink)
+            .build()
+            .unwrap();
+        assert!(capture_frame(&player).is_err());
+        player.set_state(gst::State::Paused).unwrap();
+        let (result, current, _) = player.state(gst::ClockTime::from_seconds(10));
+        result.unwrap();
+        assert_eq!(current, gst::State::Paused);
+        let jpeg = capture_frame(&player).unwrap();
+        assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]));
+        assert!(jpeg.ends_with(&[0xff, 0xd9]));
+        player.set_state(gst::State::Null).unwrap();
+    }
+
+    #[test]
+    fn capture_filenames_include_safe_camera_name_and_timestamp() {
+        assert_eq!(
+            suggested_filename(
+                "Front / Door",
+                "recording",
+                "mkv",
+                "2026-11-21_13-05-09.123"
+            ),
+            "Front---Door-recording-2026-11-21_13-05-09.123.mkv"
+        );
+        assert_eq!(
+            suggested_filename("", "snapshot", "jpg", "2026-11-21_13-05-09.123"),
+            "camera-snapshot-2026-11-21_13-05-09.123.jpg"
+        );
+    }
 
     #[test]
     fn initial_video_size_fits_portrait_and_landscape_profiles() {

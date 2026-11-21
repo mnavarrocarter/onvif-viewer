@@ -6,7 +6,10 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, Sender, TryRecvError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -136,17 +139,11 @@ fn run(
 }
 
 fn build_pipeline(request: &Request) -> Result<gst::Pipeline, String> {
-    // Every branch stays compressed. Matroska handles the common ONVIF RTSP
-    // combinations below, including AAC, Opus and G.711 audio when present.
+    // Create branches only for streams the camera actually advertises.
+    // Pre-requesting muxer pads for absent streams prevents muxing and preroll.
     let description = format!(
         "matroskamux name=mux ! filesink name=sink \
-         rtspsrc name=source latency={RTSP_LATENCY_MS} drop-on-latency=true protocols=tcp \
-         source. ! application/x-rtp,media=video,encoding-name=H264 ! rtph264depay ! h264parse config-interval=-1 ! mux. \
-         source. ! application/x-rtp,media=video,encoding-name=H265 ! rtph265depay ! h265parse config-interval=-1 ! mux. \
-         source. ! application/x-rtp,media=audio,encoding-name=MPEG4-GENERIC ! rtpmp4gdepay ! aacparse ! mux. \
-         source. ! application/x-rtp,media=audio,encoding-name=OPUS ! rtpopusdepay ! opusparse ! mux. \
-         source. ! application/x-rtp,media=audio,encoding-name=PCMA ! rtppcmadepay ! mux. \
-         source. ! application/x-rtp,media=audio,encoding-name=PCMU ! rtppcmudepay ! mux."
+         rtspsrc name=source latency={RTSP_LATENCY_MS} drop-on-latency=true protocols=tcp"
     );
     let pipeline = gst::parse::launch(&description)
         .map_err(|_| {
@@ -161,6 +158,67 @@ fn build_pipeline(request: &Request) -> Result<gst::Pipeline, String> {
     source.set_property("location", &request.uri);
     source.set_property("user-id", &request.username);
     source.set_property("user-pw", &request.password);
+    let mux = pipeline
+        .by_name("mux")
+        .ok_or_else(|| "Could not configure the recording muxer.".to_owned())?;
+    let weak_pipeline = pipeline.downgrade();
+    let weak_mux = mux.downgrade();
+    // Hold the first packets until all advertised streams have requested muxer
+    // pads; otherwise Matroska may write its header before a later track exists.
+    let pending = Arc::new(Mutex::new((
+        false,
+        Vec::<(gst::Pad, gst::PadProbeId)>::new(),
+    )));
+    let pads_ready = Arc::clone(&pending);
+    source.connect_no_more_pads(move |_| {
+        let mut pending = pads_ready.lock().unwrap();
+        pending.0 = true;
+        for (pad, probe) in pending.1.drain(..) {
+            pad.remove_probe(probe);
+        }
+    });
+    source.connect_pad_added(move |source, pad| {
+        let Some(caps) = pad.current_caps() else {
+            return;
+        };
+        let Some(structure) = caps.structure(0) else {
+            return;
+        };
+        let media = structure.get::<&str>("media").unwrap_or("");
+        let encoding = structure.get::<&str>("encoding-name").unwrap_or("");
+        let branch = match (media, encoding) {
+            ("video", "H264") => "rtph264depay ! h264parse config-interval=-1",
+            ("video", "H265") => "rtph265depay ! h265parse config-interval=-1",
+            ("audio", "MPEG4-GENERIC") => "rtpmp4gdepay ! aacparse",
+            ("audio", "OPUS") => "rtpopusdepay ! opusparse",
+            ("audio", "PCMA") => "rtppcmadepay",
+            ("audio", "PCMU") => "rtppcmudepay",
+            _ => return,
+        };
+        let mut pending = pending.lock().unwrap();
+        if !pending.0
+            && let Some(probe) = pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_, _| {
+                gst::PadProbeReturn::Ok
+            })
+        {
+            pending.1.push((pad.clone(), probe));
+        }
+        let result = weak_pipeline
+            .upgrade()
+            .zip(weak_mux.upgrade())
+            .ok_or(())
+            .and_then(|(pipeline, mux)| {
+                link_recording_stream(&pipeline, &mux, pad, branch).map_err(|_| ())
+            });
+        drop(pending);
+        if result.is_err() {
+            gst::element_error!(
+                source,
+                gst::StreamError::Failed,
+                ("Could not configure a recording stream. Check the GStreamer plugins.")
+            );
+        }
+    });
     let destination = request.destination.to_string_lossy();
     let sink = pipeline
         .by_name("sink")
@@ -169,22 +227,23 @@ fn build_pipeline(request: &Request) -> Result<gst::Pipeline, String> {
     Ok(pipeline)
 }
 
-/// Suggest a Matroska filename for a camera.
-pub fn default_filename(camera_name: &str) -> String {
-    let stem: String = camera_name
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!(
-        "{}-recording.mkv",
-        if stem.is_empty() { "camera" } else { &stem }
-    )
+fn link_recording_stream(
+    pipeline: &gst::Pipeline,
+    mux: &gst::Element,
+    pad: &gst::Pad,
+    description: &str,
+) -> Result<(), gst::glib::BoolError> {
+    let bin = gst::parse::bin_from_description(description, true)
+        .map_err(|_| gst::glib::bool_error!("Could not create recording stream"))?;
+    pipeline.add(&bin)?;
+    bin.link(mux)?;
+    bin.sync_state_with_parent()?;
+    let sink = bin
+        .static_pad("sink")
+        .ok_or_else(|| gst::glib::bool_error!("Missing recording sink pad"))?;
+    pad.link(&sink)
+        .map_err(|_| gst::glib::bool_error!("Could not link recording stream"))?;
+    Ok(())
 }
 
 /// Validates the destination before the worker starts, producing an actionable
@@ -204,14 +263,86 @@ pub fn validate_destination(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::default_filename;
+    use super::*;
 
     #[test]
-    fn filename_is_visible_and_safe() {
-        assert_eq!(
-            default_filename("Front / Door"),
-            "Front---Door-recording.mkv"
+    fn records_and_finalizes_a_single_audio_stream() {
+        gst::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mkv");
+        let pipeline = build_pipeline(&Request {
+            uri: "rtsp://127.0.0.1/test".into(),
+            username: String::new(),
+            password: String::new(),
+            destination: path.clone(),
+        })
+        .unwrap();
+        pipeline
+            .remove(&pipeline.by_name("source").unwrap())
+            .unwrap();
+        let source = gst::parse::bin_from_description(
+            "audiotestsrc num-buffers=50 ! audioconvert ! alawenc ! rtppcmapay",
+            true,
+        )
+        .unwrap();
+        pipeline.add(&source).unwrap();
+        link_recording_stream(
+            &pipeline,
+            &pipeline.by_name("mux").unwrap(),
+            &source.static_pad("src").unwrap(),
+            "rtppcmadepay",
+        )
+        .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let bus = pipeline.bus().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut started = false;
+        let mut finished = false;
+        while Instant::now() < deadline {
+            if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
+                match message.view() {
+                    gst::MessageView::StateChanged(state)
+                        if state
+                            .src()
+                            .is_some_and(|s| s == pipeline.upcast_ref::<gst::Object>())
+                            && state.current() == gst::State::Playing =>
+                    {
+                        started = true
+                    }
+                    gst::MessageView::Eos(..) => {
+                        finished = true;
+                        break;
+                    }
+                    gst::MessageView::Error(error) => panic!("Recording failed: {}", error.error()),
+                    _ => {}
+                }
+            }
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(started, "single-stream pipeline never started");
+        assert!(finished, "single-stream pipeline never finalized");
+        assert!(std::fs::metadata(&path).unwrap().len() > 1024);
+        let decoder = gst::parse::launch("filesrc name=input ! matroskademux ! alawdec ! fakesink")
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        decoder
+            .by_name("input")
+            .unwrap()
+            .set_property("location", path.to_str().unwrap());
+        decoder.set_state(gst::State::Playing).unwrap();
+        let message = decoder
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .expect("recording playback timed out");
+        decoder.set_state(gst::State::Null).unwrap();
+        assert!(
+            matches!(message.view(), gst::MessageView::Eos(_)),
+            "{message:?}"
         );
-        assert_eq!(default_filename(""), "camera-recording.mkv");
     }
 }
