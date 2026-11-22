@@ -32,19 +32,29 @@ enum PtzEvent {
 
 // One worker serializes movement and stop requests across profile changes.
 async fn run_ptz(mut requests: watch::Receiver<PtzRequest>, events: mpsc::Sender<PtzEvent>) {
-    let mut current: Option<(onvif::Camera, String, u64)> = None;
+    let mut current: Option<(onvif::Camera, String, u64, u64)> = None;
+    let mut lease: Option<crate::ptz_lease::Lease> = None;
     let mut moving = false;
     let mut failed_generation = None;
     loop {
         let request = requests.borrow_and_update().clone();
         let generation = request.target.as_ref().map(|target| target.generation);
-        if current.as_ref().map(|(_, _, generation)| *generation) != generation || request.shutdown
+        if current.as_ref().map(|(_, _, generation, _)| *generation) != generation
+            || request.shutdown
         {
-            if let Some((camera, token, old_generation)) = current.take()
+            if let Some((camera, token, old_generation, _)) = current.take()
                 && moving
             {
-                if let Err(error) = camera.ptz_stop(&token).await {
-                    let _ = events.send(PtzEvent::Error(old_generation, error.to_string()));
+                match camera.ptz_stop(&token).await {
+                    Ok(()) => {
+                        if let Some(lease) = lease.take() {
+                            lease.stopped();
+                        }
+                    }
+                    Err(error) => {
+                        lease.take();
+                        let _ = events.send(PtzEvent::Error(old_generation, error.to_string()));
+                    }
                 }
                 moving = false;
             }
@@ -71,7 +81,12 @@ async fn run_ptz(mut requests: watch::Receiver<PtzRequest>, events: mpsc::Sender
                 Ok((camera, supported)) => {
                     let _ = events.send(PtzEvent::Supported(target.generation, supported));
                     if supported {
-                        current = Some((camera, target.token.clone(), target.generation));
+                        current = Some((
+                            camera,
+                            target.token.clone(),
+                            target.generation,
+                            target.source.id,
+                        ));
                     } else {
                         failed_generation = generation;
                     }
@@ -83,15 +98,35 @@ async fn run_ptz(mut requests: watch::Receiver<PtzRequest>, events: mpsc::Sender
             }
             continue;
         }
-        if let Some((camera, token, generation)) = &current {
+        if let Some((camera, token, generation, camera_id)) = &current {
             let result = if request.direction != (0.0, 0.0) {
+                if lease.is_none() {
+                    lease = crate::ptz_lease::Lease::acquire(*camera_id);
+                    if lease.is_none() {
+                        failed_generation = Some(*generation);
+                        let _ = events.send(PtzEvent::Error(
+                            *generation,
+                            "Another viewer controls this camera.".into(),
+                        ));
+                        current = None;
+                        continue;
+                    }
+                }
                 moving = true;
                 camera
                     .ptz_move(token, request.direction.0, request.direction.1)
                     .await
             } else if moving {
                 moving = false;
-                camera.ptz_stop(token).await
+                let result = camera.ptz_stop(token).await;
+                if result.is_ok() {
+                    if let Some(lease) = lease.take() {
+                        lease.stopped();
+                    }
+                } else {
+                    lease.take();
+                }
+                result
             } else {
                 if requests.changed().await.is_err() {
                     break;
@@ -102,7 +137,10 @@ async fn run_ptz(mut requests: watch::Receiver<PtzRequest>, events: mpsc::Sender
                 // A failed move may still have reached the camera.
                 if moving {
                     if let Err(stop_error) = camera.ptz_stop(token).await {
+                        lease.take();
                         let _ = events.send(PtzEvent::Error(*generation, stop_error.to_string()));
+                    } else if let Some(lease) = lease.take() {
+                        lease.stopped();
                     }
                     moving = false;
                 }

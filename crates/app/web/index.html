@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ONVIF Viewer</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none">
+          <rect x="3" y="5" width="14" height="14" rx="4" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M17 10 21 7.75v8.5L17 14" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+          <circle cx="10" cy="12" r="2.25" stroke="currentColor" stroke-width="1.6"/>
+        </svg>
+      </span>
+      <div><span class="brand-eyebrow">LAN CAMERA VIEWER</span><h1>ONVIF Viewer</h1></div>
+    </div>
+    <button id="refresh" class="refresh-button" type="button">Refresh cameras</button>
+  </header>
+  <main>
+    <div class="section-heading">
+      <div><p class="section-eyebrow">CAMERA LIBRARY</p><h2>Camera feeds</h2></div>
+      <p>Choose a camera to start watching.</p>
+    </div>
+    <p id="message" role="status" aria-live="polite">Loading cameras…</p>
+    <div id="cameras" class="grid"></div>
+  </main>
+</body>
+</html>
