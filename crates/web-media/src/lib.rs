@@ -827,9 +827,24 @@ impl Peer {
 impl Drop for Peer {
     fn drop(&mut self) {
         for branch in self.branches.lock().unwrap().drain(..) {
-            let _ = branch.tee_pad.push_event(gst::event::FlushStart::new());
+            // Quiesce the tee before unlinking: a flushing flow return from a
+            // removed branch must not propagate into the shared ingest.
+            let (idle_tx, idle_rx) = mpsc::sync_channel(1);
+            let probe = branch
+                .tee_pad
+                .add_probe(gst::PadProbeType::IDLE, move |_, _| {
+                    let _ = idle_tx.try_send(());
+                    gst::PadProbeReturn::Ok
+                });
+            let _ = idle_rx.recv_timeout(TIMEOUT);
             if let Some(sink) = branch.bin.static_pad("sink") {
                 let _ = branch.tee_pad.unlink(&sink);
+            }
+            if let Some(probe) = probe {
+                branch.tee_pad.remove_probe(probe);
+            }
+            if let Some(sink) = branch.bin.static_pad("sink") {
+                let _ = sink.send_event(gst::event::FlushStart::new());
             }
             if let Some(src) = branch.bin.static_pad("src") {
                 let _ = src.unlink(&branch.sink_pad);
