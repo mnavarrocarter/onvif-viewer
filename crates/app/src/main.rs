@@ -1,8 +1,15 @@
 mod feed;
 mod grid_playback;
 mod ptz;
+mod ptz_lease;
 mod settings;
 mod storage;
+mod web_config;
+mod web_controller;
+mod web_ptz;
+mod web_security;
+mod web_server;
+mod web_settings;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -218,6 +225,7 @@ struct Library {
     layout_size: Cell<(u32, i32)>,
     toasts: adw::ToastOverlay,
     header_add: glib::WeakRef<gtk::Button>,
+    web: web_controller::Controller,
     store: Option<mpsc::Sender<StoreRequest>>,
     sources: RefCell<Vec<Source>>,
     busy: Cell<bool>,
@@ -284,6 +292,7 @@ impl Library {
 
     fn refresh(self: &Rc<Self>) {
         let sources = self.sources.borrow().clone();
+        *self.web.sources.write().unwrap() = sources.clone();
         self.queue_grid_layout();
         let mut removed = Vec::new();
         self.tiles.borrow_mut().retain(|id, tile| {
@@ -1138,6 +1147,7 @@ fn build_ui(app: &Application) {
     let header = adw::HeaderBar::new();
     header.pack_start(&add);
     let menu = gtk::gio::Menu::new();
+    menu.append(Some("LAN Web Viewer"), Some("win.web-viewer"));
     menu.append(Some("About ONVIF Viewer"), Some("win.about"));
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
@@ -1172,6 +1182,7 @@ fn build_ui(app: &Application) {
         }
     });
     window.add_action(&about);
+    let (web, web_startup) = web_controller::Controller::start();
     let library = Rc::new(Library {
         window: window.downgrade(),
         stack,
@@ -1182,6 +1193,7 @@ fn build_ui(app: &Application) {
         layout_size: Cell::new((0, 0)),
         toasts,
         header_add: add.downgrade(),
+        web,
         store: start_store_worker(),
         sources: RefCell::new(Vec::new()),
         busy: Cell::new(false),
@@ -1195,6 +1207,25 @@ fn build_ui(app: &Application) {
         load_retry: load_retry.clone(),
         empty_add: empty_add.clone(),
     });
+    let weak = Rc::downgrade(&library);
+    await_store(web_startup, move |result| {
+        if let Err(error) = result
+            && let Some(library) = weak.upgrade()
+        {
+            library.toasts.add_toast(adw::Toast::new(&format!("LAN viewer: {error}")));
+        }
+    });
+    let web_action = gtk::gio::SimpleAction::new("web-viewer", None);
+    let weak = Rc::downgrade(&library);
+    web_action.connect_activate(move |_, _| {
+        if let Some(library) = weak.upgrade()
+            && let Some(parent) = library.window.upgrade()
+        {
+            let web = library.web.clone();
+            web_settings::open(&parent, move |config| web.apply(config));
+        }
+    });
+    window.add_action(&web_action);
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let weak = Rc::downgrade(&library);
@@ -1255,6 +1286,7 @@ fn build_ui(app: &Application) {
     window.connect_close_request(move |_| {
         if let Some(library) = weak.upgrade() {
             library.shutting_down.set(true);
+            library.web.shutdown();
             for tile in library.tiles.borrow().values() {
                 tile.ptz.shutdown();
                 tile.resume.set(false);
