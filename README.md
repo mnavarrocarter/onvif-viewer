@@ -32,6 +32,8 @@ Select **Add Camera**, then enter its ONVIF device service URL including its por
 
 Select the video area to open a separate feed window. The grid stream stops while feed windows for that camera are open and resumes when the last one closes if it was playing before. Use the tile's settings button to edit or remove the camera. The profile menu on either surface chooses the profile for feed windows; changing it also switches any open feeds. The feed window has its own mute and volume controls.
 
+Camera Settings also retrieves device information from the saved ONVIF address and credentials. Manufacturer, model, firmware version, and serial number are shown when the device supplies them; missing values are unavailable. A connection failure can be retried without changing the saved settings. Information describes the saved connection, not unsaved edits.
+
 When a camera profile supports continuous pan and tilt, its grid tile and feed toolbar offer a directional control toggle. Turn it on to capture arrow keys: hold a key to move the camera and release it to stop. Only one grid tile captures keys at a time. Capture turns off and movement stops when the window loses focus, the camera is removed or updated, or its feed opens or changes profile. Grid controls use the grid stream's lowest-resolution profile; feed controls use the selected feed profile. Camera-side movement timeouts limit motion if the connection fails; cameras must honor those timeouts.
 
 Use the camera icon on a playing tile or feed window to save the current decoded video frame as a JPEG. Snapshots use the live stream's resolution and may reflect its buffering delay. The suggested filename includes the local date and time. Capture and file errors are shown separately.

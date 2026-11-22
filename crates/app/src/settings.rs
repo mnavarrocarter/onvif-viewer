@@ -20,10 +20,110 @@ struct Settings {
     status: gtk::Label,
     spinner: gtk::Spinner,
     cancel: RefCell<Option<watch::Sender<bool>>>,
+    info_cancel: RefCell<Option<watch::Sender<bool>>>,
+    info_status: gtk::Label,
+    info_spinner: gtk::Spinner,
+    info_retry: gtk::Button,
+    info_rows: [adw::ActionRow; 4],
     closed: Cell<bool>,
 }
 
 impl Settings {
+    fn load_information(self: &Rc<Self>, source: &Source) {
+        if let Some(cancel) = self.info_cancel.borrow_mut().take() {
+            let _ = cancel.send(true);
+        }
+        for row in &self.info_rows {
+            row.set_visible(false);
+        }
+        self.info_status.remove_css_class("error");
+        self.info_status.set_text("Loading device information…");
+        self.info_spinner.start();
+        self.info_retry.set_sensitive(false);
+
+        let address = source.address.clone();
+        let username = source.username.clone();
+        let password = source.password.clone();
+        let (cancel, mut cancel_rx) = watch::channel(false);
+        let (tx, rx) = mpsc::channel();
+        if std::thread::Builder::new()
+            .name("onvif-device-info".into())
+            .spawn(move || {
+                let result = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => {
+                        let Some(result) = runtime.block_on(async {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_rx.changed() => None,
+                            result = onvif::device_information(&address, &username, &password) => {
+                                Some(result.map_err(|error| connection_error(&error)))
+                            }
+                        }
+                    }) else { return };
+                        result
+                    }
+                    Err(_) => Err("Could not initialize the camera connection. Try again."),
+                };
+                let _ = tx.send(result);
+            })
+            .is_err()
+        {
+            self.info_spinner.stop();
+            self.info_status.add_css_class("error");
+            self.info_status
+                .set_text("Could not start the camera connection. Try again.");
+            self.info_retry.set_sensitive(true);
+            return;
+        }
+        *self.info_cancel.borrow_mut() = Some(cancel);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            let Some(ui) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if ui.closed.get() {
+                return glib::ControlFlow::Break;
+            }
+            let result = match rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err("Camera connection ended unexpectedly. Try again.")
+                }
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            };
+            ui.info_cancel.borrow_mut().take();
+            ui.info_spinner.stop();
+            ui.info_retry.set_sensitive(true);
+            match result {
+                Ok(info) => {
+                    for (row, value) in ui.info_rows.iter().zip([
+                        info.manufacturer,
+                        info.model,
+                        info.firmware_version,
+                        info.serial_number,
+                    ]) {
+                        let value = value.trim();
+                        row.set_subtitle(if value.is_empty() {
+                            "Unavailable"
+                        } else {
+                            value
+                        });
+                        row.set_visible(true);
+                    }
+                    ui.info_status.set_text("Device information loaded.");
+                }
+                Err(error) => {
+                    ui.info_status.add_css_class("error");
+                    ui.info_status.set_text(error);
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
     fn set_busy(&self, busy: bool) {
         self.name.set_sensitive(!busy);
         self.address.set_sensitive(!busy);
@@ -121,6 +221,28 @@ pub fn open(
     group.add(&address);
     group.add(&username);
     group.add(&password);
+    let info_group = adw::PreferencesGroup::new();
+    info_group.set_title("Device Information");
+    info_group.set_description(Some(
+        "Live information for the saved camera. Unsaved changes above are not used.",
+    ));
+    let info_rows = ["Manufacturer", "Model", "Firmware Version", "Serial Number"].map(|title| {
+        let row = adw::ActionRow::builder().title(title).build();
+        row.set_use_markup(false);
+        row.set_visible(false);
+        info_group.add(&row);
+        row
+    });
+    let info_status = gtk::Label::new(None);
+    info_status.set_wrap(true);
+    info_status.set_xalign(0.0);
+    info_status.set_hexpand(true);
+    let info_spinner = gtk::Spinner::new();
+    let info_retry = gtk::Button::with_label("Retry");
+    let info_status_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    info_status_row.append(&info_spinner);
+    info_status_row.append(&info_status);
+    info_status_row.append(&info_retry);
     let status = gtk::Label::new(None);
     status.set_wrap(true);
     status.set_xalign(0.0);
@@ -136,6 +258,8 @@ pub fn open(
     body.set_margin_start(18);
     body.set_margin_end(18);
     body.append(&group);
+    body.append(&info_group);
+    body.append(&info_status_row);
     body.append(&status_row);
     body.append(&remove);
     let scroll = gtk::ScrolledWindow::builder()
@@ -159,8 +283,15 @@ pub fn open(
         .build();
     // Keep the fallback scroller for small displays and long error messages.
     // Initially fit the form at its chosen width instead of scrolling its rows.
+    for row in &info_rows {
+        row.set_visible(true);
+        row.set_subtitle("Unavailable");
+    }
     let (_, body_height, _, _) = body.measure(gtk::Orientation::Vertical, 500);
     let (_, header_height, _, _) = header.measure(gtk::Orientation::Vertical, 500);
+    for row in &info_rows {
+        row.set_visible(false);
+    }
     window.set_default_size(500, (body_height + header_height + 24).max(480));
     let ui = Rc::new(Settings {
         window,
@@ -173,6 +304,11 @@ pub fn open(
         status,
         spinner,
         cancel: RefCell::new(None),
+        info_cancel: RefCell::new(None),
+        info_status,
+        info_spinner,
+        info_retry,
+        info_rows,
         closed: Cell::new(false),
     });
 
@@ -183,8 +319,19 @@ pub fn open(
             if let Some(cancel) = ui.cancel.borrow_mut().take() {
                 let _ = cancel.send(true);
             }
+            if let Some(cancel) = ui.info_cancel.borrow_mut().take() {
+                let _ = cancel.send(true);
+            }
         }
     });
+    let info_source = source.clone();
+    let weak = Rc::downgrade(&ui);
+    ui.info_retry.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.load_information(&info_source);
+        }
+    });
+    ui.load_information(&source);
     let weak = Rc::downgrade(&ui);
     let id = source.id;
     ui.remove.connect_clicked(move |_| {
