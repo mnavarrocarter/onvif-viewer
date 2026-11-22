@@ -66,6 +66,7 @@ function cameraTile(camera) {
   const head = element('div', 'camera-head');
   head.append(element('h2', '', camera.name));
   const expand = button('Expand');
+  expand.className = 'expand-control';
   head.append(expand);
   const video = element('video');
   video.autoplay = true;
@@ -80,9 +81,11 @@ function cameraTile(camera) {
     profiles.append(option);
   }
   const play = button('Play');
+  play.className = 'play-control';
   controls.append(profiles, play);
   const audio = element('div', 'audio');
   const mute = button('Unmute');
+  mute.className = 'mute-control';
   const volumeLabel = element('label', '', 'Volume');
   const volume = element('input');
   volume.type = 'range'; volume.min = '0'; volume.max = '1'; volume.step = '0.05'; volume.value = '1';
@@ -104,15 +107,17 @@ function cameraTile(camera) {
   function setStatus(text, error = false) {
     status.textContent = text;
     status.classList.toggle('error', error);
+    status.classList.toggle('playing', text === 'Playing');
   }
   function selectedProfile() { return camera.profiles.find(profile => profile.token === profiles.value); }
   function update() {
     const active = current !== null;
     play.textContent = active ? 'Stop' : 'Play';
+    play.classList.toggle('is-active', active);
     play.disabled = !camera.profiles.length;
     const available = Boolean(current && current.id && selectedProfile()?.ptz);
     for (const control of directionButtons) control.disabled = !available;
-    ptz.hidden = !selectedProfile()?.ptz;
+    ptz.hidden = !available;
     help.hidden = ptz.hidden;
   }
   function queuePtz(session, x, y, keepalive = false) {
