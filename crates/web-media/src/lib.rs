@@ -20,6 +20,9 @@ use gstreamer_webrtc as webrtc;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SDP: usize = 256 * 1024;
+const VIDEO_TRANSCODE: &str = "decodebin ! videoconvert ! videoscale ! videorate ! video/x-raw,format=I420,width=(int)[16,1280],height=(int)[16,720],framerate=(fraction)[0/1,30/1] ! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=60 bitrate=2000 ! video/x-h264,profile=constrained-baseline ! h264parse name=web_output config-interval=-1";
+const AUDIO_TRANSCODE: &str =
+    "decodebin ! audioconvert ! audioresample ! opusenc name=web_output bitrate=64000";
 
 /// The camera URI can itself contain credentials. Never log this value.
 pub struct Request {
@@ -54,6 +57,40 @@ fn browser_rtp_compatible(caps: &gst::StructureRef, codec: &str) -> bool {
         .ok()
         .is_some_and(|name| name.eq_ignore_ascii_case(codec))
         && (codec != "H264" || caps.get::<&str>("packetization-mode").ok() == Some("1"))
+}
+fn outbound_caps(caps: &gst::Caps, codec: &str) -> gst::Caps {
+    let mut result = caps.clone();
+    if codec == "H264" {
+        // 42c0 and 42e0 both describe constrained-baseline, but caps
+        // compare profile-level-id byte-for-byte rather than by profile.
+        result
+            .make_mut()
+            .structure_mut(0)
+            .unwrap()
+            .remove_field("profile-level-id");
+    }
+    result
+}
+
+fn media_decoder_bin(depay: &str, tail: &str) -> Result<gst::Bin, String> {
+    let bin = gst::parse::bin_from_description(&format!("{depay} name=web_depay ! {tail}"), false)
+        .map_err(|_| {
+            "Could not construct the camera media decoder; check depayloader and decoder plugins."
+                .to_owned()
+        })?;
+    for (element, pad, name) in [("web_depay", "sink", "sink"), ("web_output", "src", "src")] {
+        let target = bin
+            .by_name(element)
+            .and_then(|element| element.static_pad(pad))
+            .ok_or_else(|| "The camera media decoder is missing a pad.".to_owned())?;
+        let ghost = gst::GhostPad::builder_with_target(&target)
+            .map_err(|_| "Could not configure the camera media decoder pad.".to_owned())?
+            .name(name)
+            .build();
+        bin.add_pad(&ghost)
+            .map_err(|_| "Could not add the camera media decoder pad.".to_owned())?;
+    }
+    Ok(bin)
 }
 
 /// Owns the registry of shared ingests. Dropping it does not stop retained streams.
@@ -94,6 +131,8 @@ impl MediaManager {
             "tee",
             "fakesink",
             "videoconvert",
+            "videoscale",
+            "videorate",
             "x264enc",
             "h264parse",
             "audioconvert",
@@ -121,7 +160,7 @@ struct Tracks {
     audio: bool,
     unsupported_audio: bool,
     ready: bool,
-    failed: bool,
+    failed: Option<String>,
 }
 struct Inner {
     pipeline: gst::Pipeline,
@@ -129,7 +168,7 @@ struct Inner {
     audio: gst::Element,
     tracks: Arc<(Mutex<Tracks>, Condvar)>,
     peers: Mutex<usize>,
-    failure: Mutex<Option<Error>>,
+    failure: Arc<Mutex<Option<Error>>>,
     max_peers: usize,
 }
 impl Drop for Inner {
@@ -147,6 +186,31 @@ impl Inner {
         .map_err(|_| error("Could not construct the camera pipeline. Check GStreamer plugins."))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| error("Could not construct the camera pipeline."))?;
+        let failure = Arc::new(Mutex::new(None));
+        let reported_failure = Arc::clone(&failure);
+        pipeline.bus().ok_or_else(|| error("Could not monitor camera ingest."))?
+            .set_sync_handler(move |_, message| {
+                let failure = match message.view() {
+                    gst::MessageView::Error(message) => {
+                        let factory = message.src().and_then(|source| source.downcast_ref::<gst::Element>())
+                            .and_then(|element| element.factory()).map(|factory| factory.name().to_string())
+                            .unwrap_or_else(|| "GStreamer".to_owned());
+                        let category = message.error().kind::<gst::StreamError>();
+                        let reason = message.debug().and_then(|debug| {
+                            ["not-negotiated", "not-linked", "not-supported", "flushing"]
+                                .into_iter().find(|reason| debug.contains(reason))
+                        });
+                        Some(error(format!("Camera media failed in {factory} ({category:?}, {reason:?}). Check camera connectivity and GStreamer codec plugins.")))
+                    },
+                    gst::MessageView::Eos(_) => Some(error("Camera media ended.")),
+                    _ => None,
+                };
+                if let Some(failure) = failure {
+                    let mut reported = reported_failure.lock().unwrap();
+                    if reported.is_none() { *reported = Some(failure); }
+                }
+                gst::BusSyncReply::Drop
+            });
         let source = pipeline
             .by_name("source")
             .ok_or_else(|| error("Could not configure the camera source."))?;
@@ -186,27 +250,26 @@ impl Inner {
             let mut state = lock.lock().unwrap();
             if (media == "video" && state.video) || (media == "audio" && state.audio) { return; }
             let tail = if media == "video" {
-                "decodebin ! videoconvert ! video/x-raw,format=I420 ! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=60 bitrate=2000 ! video/x-h264,profile=baseline ! h264parse config-interval=-1"
+                VIDEO_TRANSCODE
             } else if codec == "OPUS" && browser_opus_rtp(s) && gst::ElementFactory::find("opusparse").is_some() {
-                "opusparse"
+                "opusparse name=web_output"
             } else {
-                "decodebin ! audioconvert ! audioresample ! opusenc bitrate=64000"
+                AUDIO_TRANSCODE
             };
-            let result = (|| -> Result<(), gst::glib::BoolError> {
-                let pipeline = weak_pipeline.upgrade().ok_or_else(|| gst::glib::bool_error!("pipeline closed"))?;
+            let result = (|| -> Result<(), String> {
+                let pipeline = weak_pipeline.upgrade().ok_or("The camera media pipeline closed.")?;
                 let tee = if media == "video" { weak_video.upgrade() } else { weak_audio.upgrade() }
-                    .ok_or_else(|| gst::glib::bool_error!("pipeline closed"))?;
-                let bin = gst::parse::bin_from_description(&format!("{depay} ! {tail}"), true)
-                    .map_err(|_| gst::glib::bool_error!("missing decoder or depayloader"))?;
-                pipeline.add(&bin)?;
-                bin.link(&tee)?;
-                bin.sync_state_with_parent()?;
-                pad.link(&bin.static_pad("sink").ok_or_else(|| gst::glib::bool_error!("missing sink"))?)
-                    .map_err(|_| gst::glib::bool_error!("link failed"))?;
+                    .ok_or("The camera media output closed.")?;
+                let bin = media_decoder_bin(depay, tail)?;
+                pipeline.add(&bin).map_err(|_| "Could not add the camera media decoder.")?;
+                bin.link(&tee).map_err(|_| "Could not link the camera media decoder to its output.")?;
+                bin.sync_state_with_parent().map_err(|_| "Could not start the camera media decoder.")?;
+                let sink = bin.static_pad("sink").ok_or("The camera media decoder has no sink pad.")?;
+                pad.link(&sink).map_err(|_| format!("Could not connect the camera RTP stream to {depay}; check camera codec settings."))?;
                 Ok(())
             })();
-            if result.is_err() {
-                state.failed = true;
+            if let Err(message) = result {
+                state.failed = Some(message);
                 ready.notify_all();
                 gst::element_error!(source, gst::StreamError::Failed, ("Could not decode camera media. Check the camera codec and GStreamer decoder plugins."));
             } else if media == "video" { state.video = true; } else { state.audio = true; }
@@ -229,36 +292,16 @@ impl Inner {
             audio,
             tracks,
             peers: Mutex::new(0),
-            failure: Mutex::new(None),
+            failure,
             max_peers,
         })
     }
 
     fn check(&self) -> Result<(), Error> {
-        let mut failure = self.failure.lock().unwrap();
-        if let Some(error) = &*failure {
-            return Err(error.clone());
+        match self.failure.lock().unwrap().as_ref() {
+            Some(failure) => Err(failure.clone()),
+            None => Ok(()),
         }
-        let bus = self
-            .pipeline
-            .bus()
-            .ok_or_else(|| error("Could not monitor camera ingest."))?;
-        while let Some(message) =
-            bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])
-        {
-            let found = match message.view() {
-                gst::MessageView::Error(_) => Some(error(
-                    "Camera media failed. Check camera connectivity, credentials, and GStreamer codec plugins.",
-                )),
-                gst::MessageView::Eos(_) => Some(error("Camera media ended.")),
-                _ => None,
-            };
-            if let Some(found) = found {
-                *failure = Some(found.clone());
-                return Err(found);
-            }
-        }
-        Ok(())
     }
 }
 
@@ -288,17 +331,15 @@ impl Stream {
         let deadline = Instant::now() + TIMEOUT;
         let (lock, ready) = &*self.inner.tracks;
         let mut tracks = lock.lock().unwrap();
-        while !tracks.ready && !tracks.failed && Instant::now() < deadline {
+        while !tracks.ready && tracks.failed.is_none() && Instant::now() < deadline {
             self.inner.check()?;
             let (next, _) = ready
                 .wait_timeout(tracks, Duration::from_millis(100))
                 .unwrap();
             tracks = next;
         }
-        if tracks.failed {
-            return Err(error(
-                "Could not decode camera media. Check GStreamer codec plugins.",
-            ));
+        if let Some(message) = tracks.failed.as_ref() {
+            return Err(error(message.clone()));
         }
         if !tracks.ready {
             return Err(error(
@@ -345,15 +386,32 @@ impl Stream {
             if media.port() == 0 {
                 continue;
             }
-            let caps = media
+            let mut caps = None;
+            for candidate in media
                 .formats()
                 .filter_map(|f| f.parse::<i32>().ok())
                 .filter_map(|pt| media.caps_from_media(pt))
-                .find(|caps| {
-                    caps.structure(0)
-                        .is_some_and(|s| browser_rtp_compatible(s, codec))
-                });
-            if let Some(caps) = caps {
+            {
+                let Some(format) = candidate.structure(0) else {
+                    continue;
+                };
+                if !browser_rtp_compatible(format, codec) {
+                    continue;
+                }
+                let preferred = codec != "H264"
+                    || format.get::<&str>("profile").ok() == Some("constrained-baseline");
+                if caps.is_none() || preferred {
+                    caps = Some(candidate);
+                }
+                if preferred {
+                    break;
+                }
+            }
+            if let Some(mut caps) = caps {
+                caps.make_mut()
+                    .structure_mut(0)
+                    .unwrap()
+                    .set_name("application/x-rtp");
                 peer.attach(tee, codec, index as u32, &caps)?;
                 if codec == "H264" {
                     video_added = true;
@@ -363,26 +421,29 @@ impl Stream {
             }
         }
         if !video_added {
-            return Err(error("The browser did not offer H.264 with packetization mode 1."));
+            return Err(error(
+                "The browser did not offer H.264 with packetization mode 1.",
+            ));
         }
         if has_audio && !audio_added {
             return Err(error("The browser did not offer Opus audio."));
         }
+        let (gathered_tx, gathered_rx) = mpsc::sync_channel(1);
+        let notify = peer
+            .webrtc
+            .connect_notify(Some("ice-gathering-state"), move |webrtc, _| {
+                if webrtc.property::<webrtc::WebRTCICEGatheringState>("ice-gathering-state")
+                    == webrtc::WebRTCICEGatheringState::Complete
+                {
+                    let _ = gathered_tx.try_send(());
+                }
+            });
         let answer = signal_promise(&peer.webrtc, "create-answer", None, true)?
             .ok_or_else(|| error("WebRTC did not produce an answer."))?;
         signal_promise(&peer.webrtc, "set-local-description", Some(&answer), false)?;
-        let deadline = Instant::now() + TIMEOUT;
-        while peer
-            .webrtc
-            .property::<webrtc::WebRTCICEGatheringState>("ice-gathering-state")
-            != webrtc::WebRTCICEGatheringState::Complete
-        {
-            self.inner.check()?;
-            if Instant::now() >= deadline {
-                return Err(error("Timed out gathering WebRTC network candidates."));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let gathered = gathered_rx.recv_timeout(TIMEOUT);
+        peer.webrtc.disconnect(notify);
+        gathered.map_err(|_| error("Timed out gathering WebRTC network candidates."))?;
         let local = peer
             .webrtc
             .property::<Option<webrtc::WebRTCSessionDescription>>("local-description")
@@ -495,11 +556,20 @@ impl Peer {
         } else {
             "rtpopuspay"
         };
+        let transceiver = self
+            .webrtc
+            .emit_by_name::<Option<webrtc::WebRTCRTPTransceiver>>(
+                "get-transceiver",
+                &[&(index as i32)],
+            )
+            .ok_or_else(|| error("Could not find the browser's WebRTC transceiver."))?;
+        transceiver.set_property("direction", webrtc::WebRTCRTPTransceiverDirection::Sendonly);
         let bin = gst::parse::bin_from_description(&format!("queue max-size-buffers=30 max-size-bytes=0 max-size-time=0 leaky=downstream ! {pay} pt={pt} ! capsfilter name=filter"), true)
             .map_err(|_| error("Could not construct a WebRTC media branch. Check GStreamer RTP plugins."))?;
+        let filter_caps = outbound_caps(caps, codec);
         bin.by_name("filter")
             .ok_or_else(|| error("Could not configure RTP caps."))?
-            .set_property("caps", caps);
+            .set_property("caps", &filter_caps);
         self.inner
             .pipeline
             .add(&bin)
@@ -528,13 +598,15 @@ impl Peer {
         bin.static_pad("src")
             .ok_or_else(|| error("Missing RTP source pad."))?
             .link(&sink_pad)
-            .map_err(|_| error("Could not link the WebRTC track."))?;
-        tee_pad
-            .link(
-                &bin.static_pad("sink")
-                    .ok_or_else(|| error("Missing RTP sink pad."))?,
-            )
-            .map_err(|_| error("Could not link the camera track."))?;
+            .map_err(|reason| {
+                error(format!("Could not link the WebRTC {codec} track: {reason}"))
+            })?;
+        let branch_sink = bin
+            .static_pad("sink")
+            .ok_or_else(|| error("Missing RTP sink pad."))?;
+        tee_pad.link(&branch_sink).map_err(|reason| {
+            error(format!("Could not link the {codec} camera track: {reason}"))
+        })?;
         bin.sync_state_with_parent()
             .map_err(|_| error("Could not start the WebRTC media branch."))?;
         Ok(())
@@ -551,6 +623,7 @@ impl Peer {
 impl Drop for Peer {
     fn drop(&mut self) {
         for branch in self.branches.lock().unwrap().drain(..) {
+            let _ = branch.tee_pad.push_event(gst::event::FlushStart::new());
             if let Some(sink) = branch.bin.static_pad("sink") {
                 let _ = branch.tee_pad.unlink(&sink);
             }
@@ -571,6 +644,79 @@ impl Drop for Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn constrained_baseline_sender_accepts_equivalent_browser_profile() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "videotestsrc num-buffers=8 ! videoconvert ! video/x-raw,width=1280,height=720,framerate=25/1 ! x264enc tune=zerolatency speed-preset=ultrafast ! video/x-h264,profile=constrained-baseline ! h264parse ! rtph264pay pt=102 ! capsfilter name=filter ! fakesink sync=false"
+        ).unwrap().downcast::<gst::Pipeline>().unwrap();
+        let offer = gst::Caps::builder("application/x-rtp")
+            .field("media", "video")
+            .field("encoding-name", "H264")
+            .field("clock-rate", 90_000i32)
+            .field("payload", 102i32)
+            .field("packetization-mode", "1")
+            .field("profile", "constrained-baseline")
+            .field("profile-level-id", "42e01f")
+            .build();
+        pipeline
+            .by_name("filter")
+            .unwrap()
+            .set_property("caps", outbound_caps(&offer, "H264"));
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let message = pipeline
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .expect("RTP output did not finish");
+        if let gst::MessageView::Error(error) = message.view() {
+            panic!("RTP negotiation failed: {}", error.error());
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    #[test]
+    fn rtp_decoders_accept_audio_and_video_with_dynamic_decodebin() {
+        gst::init().unwrap();
+        for (source, depay, tail) in [
+            (
+                "audiotestsrc num-buffers=20 ! audioconvert ! mulawenc ! rtppcmupay name=rtp",
+                "rtppcmudepay",
+                AUDIO_TRANSCODE,
+            ),
+            (
+                "videotestsrc num-buffers=20 ! videoconvert ! x264enc tune=zerolatency ! rtph264pay name=rtp",
+                "rtph264depay",
+                VIDEO_TRANSCODE,
+            ),
+        ] {
+            let pipeline = gst::parse::launch(&format!("{source} fakesink name=output sync=false"))
+                .unwrap()
+                .downcast::<gst::Pipeline>()
+                .unwrap();
+            let decoder = media_decoder_bin(depay, tail).unwrap();
+            pipeline.add(&decoder).unwrap();
+            let input = pipeline.by_name("rtp").unwrap();
+            let output = pipeline.by_name("output").unwrap();
+            gst::Element::link_many([&input, decoder.upcast_ref(), &output]).unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let message = pipeline
+                .bus()
+                .unwrap()
+                .timed_pop_filtered(
+                    gst::ClockTime::from_seconds(15),
+                    &[gst::MessageType::Error, gst::MessageType::Eos],
+                )
+                .expect("media pipeline did not finish");
+            if let gst::MessageView::Error(error) = message.view() {
+                panic!("media pipeline failed: {}", error.error());
+            }
+            pipeline.set_state(gst::State::Null).unwrap();
+        }
+    }
 
     #[test]
     fn h264_negotiation_skips_incompatible_packetization_mode() {
@@ -582,9 +728,19 @@ mod tests {
             .formats()
             .filter_map(|f| f.parse::<i32>().ok())
             .filter_map(|pt| media.caps_from_media(pt))
-            .find(|caps| caps.structure(0).is_some_and(|s| browser_rtp_compatible(s, "H264")))
+            .find(|caps| {
+                caps.structure(0)
+                    .is_some_and(|s| browser_rtp_compatible(s, "H264"))
+            })
             .unwrap();
-        assert_eq!(selected.structure(0).unwrap().get::<i32>("payload").unwrap(), 102);
+        assert_eq!(
+            selected
+                .structure(0)
+                .unwrap()
+                .get::<i32>("payload")
+                .unwrap(),
+            102
+        );
     }
 
     #[test]

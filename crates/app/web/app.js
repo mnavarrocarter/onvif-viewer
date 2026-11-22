@@ -211,7 +211,7 @@ function cameraTile(camera) {
       pc.addEventListener('track', event => {
         if (current !== session) return;
         stream.addTrack(event.track);
-        video.play().catch(error => setStatus(`Playback: ${error.message}`, true));
+        video.play().catch(error => { if (current === session) setStatus(`Playback: ${error.message}`, true); });
       });
       pc.addEventListener('connectionstatechange', () => {
         if (current !== session) return;
