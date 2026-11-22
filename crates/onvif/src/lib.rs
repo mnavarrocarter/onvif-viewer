@@ -63,20 +63,35 @@ pub struct Camera {
     password: String,
 }
 
-/// Connect to an ONVIF device using a host, base URL, or device-service URL.
-/// Network requests have bounded connect and overall timeouts.
-pub async fn connect(address: &str, username: &str, password: &str) -> Result<Camera, Error> {
+/// Fetch device information without discovering media services or profiles.
+pub async fn device_information(
+    address: &str,
+    username: &str,
+    password: &str,
+) -> Result<DeviceInformation, Error> {
     let device_url = device_url(address)?;
-    let client = Client::builder()
+    let client = http_client()?;
+    fetch_device_information(&client, &device_url, username, password).await
+}
+
+fn http_client() -> Result<Client, Error> {
+    Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .redirect(Policy::none())
         .build()
-        .map_err(|_| error("Could not initialize the camera HTTP client"))?;
+        .map_err(|_| error("Could not initialize the camera HTTP client"))
+}
 
-    let information_xml = request(
-        &client,
-        &device_url,
+async fn fetch_device_information(
+    client: &Client,
+    device_url: &Url,
+    username: &str,
+    password: &str,
+) -> Result<DeviceInformation, Error> {
+    let xml = request(
+        client,
+        device_url,
         DEVICE,
         "GetDeviceInformation",
         "<tds:GetDeviceInformation/>",
@@ -84,7 +99,15 @@ pub async fn connect(address: &str, username: &str, password: &str) -> Result<Ca
         password,
     )
     .await?;
-    let information = parse_information(&information_xml)?;
+    parse_information(&xml)
+}
+
+/// Connect to an ONVIF device using a host, base URL, or device-service URL.
+/// Network requests have bounded connect and overall timeouts.
+pub async fn connect(address: &str, username: &str, password: &str) -> Result<Camera, Error> {
+    let device_url = device_url(address)?;
+    let client = http_client()?;
+    let information = fetch_device_information(&client, &device_url, username, password).await?;
     let services_xml = request(
         &client,
         &device_url,
@@ -864,6 +887,38 @@ mod tests {
             "<d:GetDeviceInformationResponse><d:Manufacturer>Maker</d:Manufacturer><d:Model>Model</d:Model><d:FirmwareVersion/><d:SerialNumber/></d:GetDeviceInformationResponse>",
         );
         assert_eq!(parse_information(&info).unwrap().serial_number, "");
+    }
+
+    #[tokio::test]
+    async fn fetches_device_information_without_media_discovery() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let headers = std::str::from_utf8(&request).unwrap();
+            assert!(headers.starts_with("POST /onvif/device_service "));
+            assert!(headers.contains("GetDeviceInformation"));
+            let reply = soap("<d:GetDeviceInformationResponse><d:Manufacturer>Maker</d:Manufacturer><d:Model>Model</d:Model><d:FirmwareVersion/><d:SerialNumber>123</d:SerialNumber></d:GetDeviceInformationResponse>");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).unwrap();
+        });
+
+        let info = device_information(&address.to_string(), "user", "password").await.unwrap();
+        assert_eq!(info.manufacturer, "Maker");
+        assert_eq!(info.model, "Model");
+        assert_eq!(info.firmware_version, "");
+        assert_eq!(info.serial_number, "123");
+        server.join().unwrap();
     }
 
     #[tokio::test]
