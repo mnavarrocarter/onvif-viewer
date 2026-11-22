@@ -898,7 +898,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             let mut buffer = [0; 4096];
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -909,11 +911,21 @@ mod tests {
             let headers = std::str::from_utf8(&request).unwrap();
             assert!(headers.starts_with("POST /onvif/device_service "));
             assert!(headers.contains("GetDeviceInformation"));
-            let reply = soap("<d:GetDeviceInformationResponse><d:Manufacturer>Maker</d:Manufacturer><d:Model>Model</d:Model><d:FirmwareVersion/><d:SerialNumber>123</d:SerialNumber></d:GetDeviceInformationResponse>");
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).unwrap();
+            let reply = soap(
+                "<d:GetDeviceInformationResponse><d:Manufacturer>Maker</d:Manufacturer><d:Model>Model</d:Model><d:FirmwareVersion/><d:SerialNumber>123</d:SerialNumber></d:GetDeviceInformationResponse>",
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            )
+            .unwrap();
         });
 
-        let info = device_information(&address.to_string(), "user", "password").await.unwrap();
+        let info = device_information(&address.to_string(), "user", "password")
+            .await
+            .unwrap();
         assert_eq!(info.manufacturer, "Maker");
         assert_eq!(info.model, "Model");
         assert_eq!(info.firmware_version, "");
