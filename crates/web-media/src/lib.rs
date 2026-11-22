@@ -750,14 +750,17 @@ impl Peer {
         } else {
             "rtpopuspay"
         };
-        let transceiver = self
+        // GStreamer 1.24 creates the transceiver on sink-pad request, while
+        // newer versions may already have created it from the remote offer.
+        if let Some(transceiver) = self
             .webrtc
             .emit_by_name::<Option<webrtc::WebRTCRTPTransceiver>>(
                 "get-transceiver",
                 &[&(index as i32)],
             )
-            .ok_or_else(|| error("Could not find the browser's WebRTC transceiver."))?;
-        transceiver.set_property("direction", webrtc::WebRTCRTPTransceiverDirection::Sendonly);
+        {
+            transceiver.set_property("direction", webrtc::WebRTCRTPTransceiverDirection::Sendonly);
+        }
         let input_filter = if expected_input.is_some() {
             "capsfilter name=input ! "
         } else {
@@ -793,6 +796,8 @@ impl Peer {
                 return Err(error("Could not attach a WebRTC track."));
             }
         };
+        let transceiver = sink_pad.property::<webrtc::WebRTCRTPTransceiver>("transceiver");
+        transceiver.set_property("direction", webrtc::WebRTCRTPTransceiverDirection::Sendonly);
         self.branches.lock().unwrap().push(Branch {
             tee: tee.clone(),
             tee_pad: tee_pad.clone(),
