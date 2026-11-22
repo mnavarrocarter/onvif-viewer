@@ -188,10 +188,10 @@ pub fn save(config: &Config) -> Result<(), Error> {
         }
         tx.commit().map_err(|_| db_error())?;
         // The commit is authoritative; failed cleanup remains queued for retry.
-        if let Some(old) = old.as_deref() {
-            if delete_secret(old).is_ok() {
-                let _ = db.execute("DELETE FROM secret_cleanup WHERE secret_key=?1", [old]);
-            }
+        if let Some(old) = old.as_deref()
+            && delete_secret(old).is_ok()
+        {
+            let _ = db.execute("DELETE FROM secret_cleanup WHERE secret_key=?1", [old]);
         }
         Ok(())
     })

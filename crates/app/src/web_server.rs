@@ -446,7 +446,6 @@ mod tests {
         assert!(!same_web_source(&source, &changed));
     }
 
-
     #[test]
     fn listener_authenticates_assets_and_rejects_rebinding_and_cross_origin() {
         let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();

@@ -53,10 +53,11 @@ impl PtzLeases {
             cameras.entry(source.id).or_default().clone()
         };
         let mut active = slot.lock().await;
-        if let Some(current) = active.as_ref() {
-            if current.owner != session && current.renewed.elapsed() < LEASE {
-                return Err("Another viewer controls this camera".into());
-            }
+        if let Some(current) = active.as_ref()
+            && current.owner != session
+            && current.renewed.elapsed() < LEASE
+        {
+            return Err("Another viewer controls this camera".into());
         }
         if active
             .as_ref()

@@ -48,10 +48,10 @@ impl Controller {
     }
     pub fn apply(&self, config: Config) -> mpsc::Receiver<Result<(), String>> {
         let (tx, rx) = mpsc::channel();
-        if let Err(error) = self.commands.send(Command::Apply(config, tx)) {
-            if let Command::Apply(_, reply) = error.0 {
-                let _ = reply.send(Err("LAN configuration worker stopped.".into()));
-            }
+        if let Err(error) = self.commands.send(Command::Apply(config, tx))
+            && let Command::Apply(_, reply) = error.0
+        {
+            let _ = reply.send(Err("LAN configuration worker stopped.".into()));
         }
         rx
     }

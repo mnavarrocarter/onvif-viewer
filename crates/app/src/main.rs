@@ -1212,7 +1212,9 @@ fn build_ui(app: &Application) {
         if let Err(error) = result
             && let Some(library) = weak.upgrade()
         {
-            library.toasts.add_toast(adw::Toast::new(&format!("LAN viewer: {error}")));
+            library
+                .toasts
+                .add_toast(adw::Toast::new(&format!("LAN viewer: {error}")));
         }
     });
     let web_action = gtk::gio::SimpleAction::new("web-viewer", None);

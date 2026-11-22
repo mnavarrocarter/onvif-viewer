@@ -58,6 +58,109 @@ fn browser_rtp_compatible(caps: &gst::StructureRef, codec: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case(codec))
         && (codec != "H264" || caps.get::<&str>("packetization-mode").ok() == Some("1"))
 }
+fn browser_constrained_level(browser: &gst::StructureRef) -> Option<u8> {
+    let value = browser.get::<&str>("profile-level-id").ok()?;
+    if value.len() != 6 || !value.is_ascii() {
+        return None;
+    }
+    let profile = u8::from_str_radix(&value[..2], 16).ok()?;
+    let constraints = u8::from_str_radix(&value[2..4], 16).ok()?;
+    if profile != 0x42 || constraints & 0x40 == 0 || constraints & 0x03 != 0 {
+        return None;
+    }
+    let level = u8::from_str_radix(&value[4..], 16).ok()?;
+    if !matches!(
+        level,
+        10 | 11
+            | 12
+            | 13
+            | 20
+            | 21
+            | 22
+            | 30
+            | 31
+            | 32
+            | 40
+            | 41
+            | 42
+            | 50
+            | 51
+            | 52
+            | 60
+            | 61
+            | 62
+    ) {
+        return None;
+    }
+    // Level 1b uses level_idc 11 with constraint_set3_flag; round down
+    // rather than incorrectly allowing a level 1.1 camera.
+    Some(if level == 11 && constraints & 0x10 != 0 {
+        10
+    } else {
+        level
+    })
+}
+
+// Only pass camera video through when both caps prove a bounded WebRTC-compatible
+// constrained-baseline stream. Missing or unusual caps always transcode.
+fn compatible_camera_h264(camera: &gst::StructureRef, browser: &gst::StructureRef) -> bool {
+    let (Ok(width), Ok(height), Ok(rate)) = (
+        camera.get::<i32>("width"),
+        camera.get::<i32>("height"),
+        camera.get::<gst::Fraction>("framerate"),
+    ) else {
+        return false;
+    };
+    if !(16..=1280).contains(&width)
+        || !(16..=720).contains(&height)
+        || rate.denom() <= 0
+        || rate.numer() <= 0
+        || i64::from(rate.numer()) > 30 * i64::from(rate.denom())
+        || camera.get::<&str>("profile").ok() != Some("constrained-baseline")
+    {
+        return false;
+    }
+    let level = camera.get::<&str>("level").ok().and_then(|s| {
+        let (major, minor) = s.split_once('.').unwrap_or((s, "0"));
+        major
+            .parse::<u8>()
+            .ok()?
+            .checked_mul(10)?
+            .checked_add(minor.parse::<u8>().ok()?)
+    });
+    let Some(level) = level else { return false };
+    let (max_frame, max_rate) = match level {
+        10 => (99, 1485),
+        11 => (396, 3000),
+        12 => (396, 6000),
+        13 | 20 => (396, 11880),
+        21 => (792, 19800),
+        22 => (1620, 20250),
+        30 => (1620, 40500),
+        31 => (3600, 108000),
+        _ => return false,
+    };
+    let frame = i64::from((width + 15) / 16) * i64::from((height + 15) / 16);
+    let macroblocks = frame * i64::from(rate.numer());
+    let denominator = i64::from(rate.denom());
+    let within_optional_limit = |key: &str, value: i64| {
+        !browser.has_field(key)
+            || browser
+                .get::<&str>(key)
+                .ok()
+                .and_then(|limit| limit.parse::<i64>().ok())
+                .is_some_and(|limit| value <= limit)
+    };
+    frame <= max_frame
+        && macroblocks <= max_rate * denominator
+        && browser_constrained_level(browser).is_some_and(|maximum| level <= maximum)
+        && within_optional_limit("max-fs", frame)
+        && within_optional_limit("max-mbps", (macroblocks + denominator - 1) / denominator)
+        && !["max-br", "max-cpb", "max-dpb"]
+            .iter()
+            .any(|key| browser.has_field(*key))
+}
+
 fn outbound_caps(caps: &gst::Caps, codec: &str) -> gst::Caps {
     let mut result = caps.clone();
     if codec == "H264" {
@@ -129,6 +232,7 @@ impl MediaManager {
             "decodebin",
             "queue",
             "tee",
+            "valve",
             "fakesink",
             "videoconvert",
             "videoscale",
@@ -165,6 +269,9 @@ struct Tracks {
 struct Inner {
     pipeline: gst::Pipeline,
     video: gst::Element,
+    raw_video: gst::Element,
+    video_valve: Arc<Mutex<Option<gst::Element>>>,
+    transcode_peers: Mutex<usize>,
     audio: gst::Element,
     tracks: Arc<(Mutex<Tracks>, Condvar)>,
     peers: Mutex<usize>,
@@ -181,7 +288,7 @@ impl Inner {
     fn start(request: Request, max_peers: usize) -> Result<Self, Error> {
         let pipeline = gst::parse::launch(
             "rtspsrc name=source latency=500 drop-on-latency=true protocols=tcp \
-             tee name=video allow-not-linked=true tee name=audio allow-not-linked=true",
+             tee name=video allow-not-linked=true tee name=raw_video allow-not-linked=true tee name=audio allow-not-linked=true",
         )
         .map_err(|_| error("Could not construct the camera pipeline. Check GStreamer plugins."))?
         .downcast::<gst::Pipeline>()
@@ -217,6 +324,11 @@ impl Inner {
         let video = pipeline
             .by_name("video")
             .ok_or_else(|| error("Could not configure video."))?;
+        let raw_video = pipeline
+            .by_name("raw_video")
+            .ok_or_else(|| error("Could not configure the H.264 camera output."))?;
+        let video_valve = Arc::new(Mutex::new(None));
+        let pending_valve = Arc::clone(&video_valve);
         let audio = pipeline
             .by_name("audio")
             .ok_or_else(|| error("Could not configure audio."))?;
@@ -227,6 +339,7 @@ impl Inner {
         let pending = Arc::clone(&tracks);
         let weak_pipeline = pipeline.downgrade();
         let weak_video = video.downgrade();
+        let weak_raw_video = raw_video.downgrade();
         let weak_audio = audio.downgrade();
         source.connect_pad_added(move |source, pad| {
             let Some(caps) = pad.current_caps() else { return; };
@@ -260,9 +373,28 @@ impl Inner {
                 let pipeline = weak_pipeline.upgrade().ok_or("The camera media pipeline closed.")?;
                 let tee = if media == "video" { weak_video.upgrade() } else { weak_audio.upgrade() }
                     .ok_or("The camera media output closed.")?;
-                let bin = media_decoder_bin(depay, tail)?;
-                pipeline.add(&bin).map_err(|_| "Could not add the camera media decoder.")?;
-                bin.link(&tee).map_err(|_| "Could not link the camera media decoder to its output.")?;
+                let bin = if media == "video" && codec == "H264" {
+                    let raw = weak_raw_video.upgrade().ok_or("The H.264 camera output closed.")?;
+                    let source_bin = media_decoder_bin(depay, "h264parse name=web_output config-interval=-1")?;
+                    let transcode = media_decoder_bin(
+                        "queue",
+                        &format!("valve name=web_valve drop=true drop-mode=forward-sticky-events ! {VIDEO_TRANSCODE}"),
+                    )?;
+                    let valve = transcode.by_name("web_valve").ok_or("Could not configure the video transcoder.")?;
+                    pipeline.add_many([&source_bin, &transcode])
+                        .map_err(|_| "Could not add the camera video branches.")?;
+                    source_bin.link(&raw).map_err(|_| "Could not link the H.264 camera output.")?;
+                    raw.link(&transcode).map_err(|_| "Could not attach the video transcoder.")?;
+                    transcode.link(&tee).map_err(|_| "Could not link the video transcoder output.")?;
+                    transcode.sync_state_with_parent().map_err(|_| "Could not start the video transcoder.")?;
+                    *pending_valve.lock().unwrap() = Some(valve);
+                    source_bin
+                } else {
+                    let bin = media_decoder_bin(depay, tail)?;
+                    pipeline.add(&bin).map_err(|_| "Could not add the camera media decoder.")?;
+                    bin.link(&tee).map_err(|_| "Could not link the camera media decoder to its output.")?;
+                    bin
+                };
                 bin.sync_state_with_parent().map_err(|_| "Could not start the camera media decoder.")?;
                 let sink = bin.static_pad("sink").ok_or("The camera media decoder has no sink pad.")?;
                 pad.link(&sink).map_err(|_| format!("Could not connect the camera RTP stream to {depay}; check camera codec settings."))?;
@@ -289,6 +421,9 @@ impl Inner {
         Ok(Self {
             pipeline,
             video,
+            raw_video,
+            video_valve,
+            transcode_peers: Mutex::new(0),
             audio,
             tracks,
             peers: Mutex::new(0),
@@ -359,6 +494,32 @@ impl Stream {
         let has_audio = tracks.audio;
         drop(tracks);
         self.inner.check()?;
+        let mut raw_caps = None;
+        if self.inner.video_valve.lock().unwrap().is_some() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                raw_caps = self
+                    .inner
+                    .raw_video
+                    .static_pad("sink")
+                    .and_then(|pad| pad.current_caps());
+                if raw_caps
+                    .as_ref()
+                    .and_then(|caps| caps.structure(0))
+                    .is_some_and(|format| {
+                        format.has_field("profile")
+                            && format.has_field("level")
+                            && format.has_field("width")
+                            && format.has_field("height")
+                            && format.has_field("framerate")
+                    })
+                {
+                    break;
+                }
+                self.inner.check()?;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
         {
             let mut peers = self.inner.peers.lock().unwrap();
             if *peers >= self.inner.max_peers {
@@ -366,7 +527,7 @@ impl Stream {
             }
             *peers += 1;
         }
-        let peer = Peer::new(Arc::clone(&self.inner))?;
+        let mut peer = Peer::new(Arc::clone(&self.inner))?;
         let description =
             webrtc::WebRTCSessionDescription::new(webrtc::WebRTCSDPType::Offer, offer.clone());
         signal_promise(
@@ -398,8 +559,7 @@ impl Stream {
                 if !browser_rtp_compatible(format, codec) {
                     continue;
                 }
-                let preferred = codec != "H264"
-                    || format.get::<&str>("profile").ok() == Some("constrained-baseline");
+                let preferred = codec != "H264" || browser_constrained_level(format).is_some();
                 if caps.is_none() || preferred {
                     caps = Some(candidate);
                 }
@@ -412,7 +572,27 @@ impl Stream {
                     .structure_mut(0)
                     .unwrap()
                     .set_name("application/x-rtp");
-                peer.attach(tee, codec, index as u32, &caps)?;
+                let passthrough = codec == "H264"
+                    && raw_caps
+                        .as_ref()
+                        .and_then(|caps| caps.structure(0))
+                        .zip(caps.structure(0))
+                        .is_some_and(|(camera, browser)| compatible_camera_h264(camera, browser));
+                if codec == "H264" && !passthrough {
+                    peer.enable_video_transcoding();
+                }
+                let tee = if passthrough {
+                    &self.inner.raw_video
+                } else {
+                    tee
+                };
+                peer.attach(
+                    tee,
+                    codec,
+                    index as u32,
+                    &caps,
+                    if passthrough { raw_caps.as_ref() } else { None },
+                )?;
                 if codec == "H264" {
                     video_added = true;
                 } else {
@@ -512,6 +692,7 @@ struct Branch {
 pub struct Peer {
     inner: Arc<Inner>,
     webrtc: gst::Element,
+    uses_transcode: bool,
     branches: Mutex<Vec<Branch>>,
 }
 impl Peer {
@@ -533,6 +714,7 @@ impl Peer {
         let peer = Self {
             inner,
             webrtc,
+            uses_transcode: false,
             branches: Mutex::new(Vec::new()),
         };
         peer.webrtc
@@ -540,12 +722,24 @@ impl Peer {
             .map_err(|_| error("Could not start the WebRTC connection. Check ICE plugins."))?;
         Ok(peer)
     }
+    fn enable_video_transcoding(&mut self) {
+        let guard = self.inner.video_valve.lock().unwrap();
+        if let Some(valve) = guard.as_ref() {
+            let mut count = self.inner.transcode_peers.lock().unwrap();
+            if *count == 0 {
+                valve.set_property("drop", false);
+            }
+            *count += 1;
+            self.uses_transcode = true;
+        }
+    }
     fn attach(
         &self,
         tee: &gst::Element,
         codec: &str,
         index: u32,
         caps: &gst::Caps,
+        expected_input: Option<&gst::Caps>,
     ) -> Result<(), Error> {
         let pt = caps
             .structure(0)
@@ -564,8 +758,18 @@ impl Peer {
             )
             .ok_or_else(|| error("Could not find the browser's WebRTC transceiver."))?;
         transceiver.set_property("direction", webrtc::WebRTCRTPTransceiverDirection::Sendonly);
-        let bin = gst::parse::bin_from_description(&format!("queue max-size-buffers=30 max-size-bytes=0 max-size-time=0 leaky=downstream ! {pay} pt={pt} ! capsfilter name=filter"), true)
+        let input_filter = if expected_input.is_some() {
+            "capsfilter name=input ! "
+        } else {
+            ""
+        };
+        let bin = gst::parse::bin_from_description(&format!("queue max-size-buffers=30 max-size-bytes=0 max-size-time=0 leaky=downstream ! {input_filter}{pay} pt={pt} ! capsfilter name=filter"), true)
             .map_err(|_| error("Could not construct a WebRTC media branch. Check GStreamer RTP plugins."))?;
+        if let Some(expected) = expected_input {
+            bin.by_name("input")
+                .ok_or_else(|| error("Could not constrain camera H.264 caps."))?
+                .set_property("caps", expected);
+        }
         let filter_caps = outbound_caps(caps, codec);
         bin.by_name("filter")
             .ok_or_else(|| error("Could not configure RTP caps."))?
@@ -635,6 +839,16 @@ impl Drop for Peer {
             let _ = branch.bin.set_state(gst::State::Null);
             let _ = self.inner.pipeline.remove(&branch.bin);
         }
+        if self.uses_transcode {
+            let valve = self.inner.video_valve.lock().unwrap();
+            let mut count = self.inner.transcode_peers.lock().unwrap();
+            *count -= 1;
+            if *count == 0
+                && let Some(valve) = valve.as_ref()
+            {
+                valve.set_property("drop", true);
+            }
+        }
         let _ = self.webrtc.set_state(gst::State::Null);
         let _ = self.inner.pipeline.remove(&self.webrtc);
         *self.inner.peers.lock().unwrap() -= 1;
@@ -643,7 +857,171 @@ impl Drop for Peer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_h264_passthrough_and_transcoding_are_independent() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch("videotestsrc is-live=true ! videoconvert ! video/x-raw,width=320,height=240,framerate=15/1 ! x264enc tune=zerolatency speed-preset=ultrafast ! video/x-h264,profile=constrained-baseline ! h264parse ! tee name=raw_video allow-not-linked=true tee name=video allow-not-linked=true tee name=audio allow-not-linked=true")
+            .unwrap().downcast::<gst::Pipeline>().unwrap();
+        let raw_video = pipeline.by_name("raw_video").unwrap();
+        let video = pipeline.by_name("video").unwrap();
+        let audio = pipeline.by_name("audio").unwrap();
+        let transcode = media_decoder_bin(
+            "queue",
+            &format!(
+                "valve name=web_valve drop=true drop-mode=forward-sticky-events ! {VIDEO_TRANSCODE}"
+            ),
+        )
+        .unwrap();
+        let valve = transcode.by_name("web_valve").unwrap();
+        pipeline.add(&transcode).unwrap();
+        raw_video.link(&transcode).unwrap();
+        transcode.link(&video).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let stream = Stream {
+            inner: Arc::new(Inner {
+                pipeline,
+                video,
+                raw_video,
+                video_valve: Arc::new(Mutex::new(Some(valve.clone()))),
+                transcode_peers: Mutex::new(0),
+                audio,
+                tracks: Arc::new((
+                    Mutex::new(Tracks {
+                        video: true,
+                        ready: true,
+                        ..Default::default()
+                    }),
+                    Condvar::new(),
+                )),
+                peers: Mutex::new(0),
+                failure: Arc::new(Mutex::new(None)),
+                max_peers: 4,
+            }),
+        };
+        let receiver = gst::parse::launch("webrtcbin name=receiver bundle-policy=max-bundle rtph264depay name=depay ! decodebin ! videoconvert ! fakesink name=output sync=false")
+            .unwrap().downcast::<gst::Pipeline>().unwrap();
+        let webrtc = receiver.by_name("receiver").unwrap();
+        let depay = receiver.by_name("depay").unwrap();
+        webrtc.connect_pad_added(move |_, pad| {
+            let sink = depay.static_pad("sink").unwrap();
+            if !sink.is_linked() {
+                let _ = pad.link(&sink);
+            }
+        });
+        let output = receiver
+            .by_name("output")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap();
+        let (frame_tx, frame_rx) = mpsc::sync_channel(1);
+        output.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            let _ = frame_tx.try_send(());
+            gst::PadProbeReturn::Ok
+        });
+        let wanted = gst::Caps::builder("application/x-rtp")
+            .field("media", "video")
+            .field("encoding-name", "H264")
+            .field("clock-rate", 90_000i32)
+            .field("payload", 102i32)
+            .field("packetization-mode", "1")
+            .field("profile-level-id", "42e01f")
+            .build();
+        webrtc.emit_by_name::<webrtc::WebRTCRTPTransceiver>(
+            "add-transceiver",
+            &[&webrtc::WebRTCRTPTransceiverDirection::Recvonly, &wanted],
+        );
+        receiver.set_state(gst::State::Playing).unwrap();
+        let (offer_tx, offer_rx) = mpsc::sync_channel(1);
+        let promise = gst::Promise::with_change_func(move |reply| {
+            let offer = reply
+                .ok()
+                .flatten()
+                .and_then(|reply| reply.get::<webrtc::WebRTCSessionDescription>("offer").ok());
+            let _ = offer_tx.send(offer);
+        });
+        webrtc.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
+        let offer = offer_rx.recv_timeout(TIMEOUT).unwrap().unwrap();
+        let (gather_tx, gather_rx) = mpsc::sync_channel(1);
+        let notify = webrtc.connect_notify(Some("ice-gathering-state"), move |peer, _| {
+            if peer.property::<webrtc::WebRTCICEGatheringState>("ice-gathering-state")
+                == webrtc::WebRTCICEGatheringState::Complete
+            {
+                let _ = gather_tx.try_send(());
+            }
+        });
+        signal_promise(&webrtc, "set-local-description", Some(&offer), false).unwrap();
+        gather_rx.recv_timeout(TIMEOUT).unwrap();
+        webrtc.disconnect(notify);
+        let offer = webrtc
+            .property::<Option<webrtc::WebRTCSessionDescription>>("local-description")
+            .unwrap()
+            .sdp()
+            .as_text()
+            .unwrap();
+        let (direct, answer) = stream.add_peer(&offer).unwrap();
+        let answer = webrtc::WebRTCSessionDescription::new(
+            webrtc::WebRTCSDPType::Answer,
+            sdp::SDPMessage::parse_buffer(answer.as_bytes()).unwrap(),
+        );
+        signal_promise(&webrtc, "set-remote-description", Some(&answer), false).unwrap();
+        assert!(!direct.uses_transcode);
+        assert!(valve.property::<bool>("drop"));
+        frame_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("passthrough receiver decoded no frames");
+        let fallback_offer = offer.replace("profile-level-id=42e01f", "profile-level-id=42001f");
+        let (fallback, _) = stream.add_peer(&fallback_offer).unwrap();
+        assert!(fallback.uses_transcode);
+        assert!(!valve.property::<bool>("drop"));
+        drop(fallback);
+        assert!(valve.property::<bool>("drop"));
+        while frame_rx.try_recv().is_ok() {}
+        frame_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("passthrough stopped when another viewer left");
+        drop(direct);
+        receiver.set_state(gst::State::Null).unwrap();
+    }
+
     use super::*;
+    #[test]
+    fn passthrough_requires_compatible_camera_and_browser_caps() {
+        gst::init().unwrap();
+        let camera = gst::Structure::builder("video/x-h264")
+            .field("profile", "constrained-baseline")
+            .field("level", "3.1")
+            .field("width", 1280i32)
+            .field("height", 720i32)
+            .field("framerate", gst::Fraction::new(25, 1))
+            .build();
+        let browser = gst::Structure::builder("application/x-rtp")
+            .field("profile", "constrained-baseline")
+            .field("profile-level-id", "42e01f")
+            .build();
+        assert!(compatible_camera_h264(&camera, &browser));
+        let mut unsupported = camera.clone();
+        unsupported.set("width", 1920i32);
+        assert!(!compatible_camera_h264(&unsupported, &browser));
+        unsupported = camera.clone();
+        unsupported.set("profile", "high");
+        assert!(!compatible_camera_h264(&unsupported, &browser));
+        unsupported = camera.clone();
+        unsupported.set("level", "2.1");
+        assert!(!compatible_camera_h264(&unsupported, &browser));
+        let mut restricted = browser.clone();
+        restricted.set("max-fs", "1000");
+        assert!(!compatible_camera_h264(&camera, &restricted));
+        let mut lower_level = browser.clone();
+        lower_level.set("profile-level-id", "42e016");
+        assert!(!compatible_camera_h264(&camera, &lower_level));
+        lower_level.set("profile-level-id", "42e1ff");
+        assert!(!compatible_camera_h264(&camera, &lower_level));
+        lower_level.set("profile-level-id", "42f00b");
+        unsupported = camera.clone();
+        unsupported.set("level", "1.1");
+        assert!(!compatible_camera_h264(&unsupported, &lower_level));
+    }
+
     #[test]
     fn constrained_baseline_sender_accepts_equivalent_browser_profile() {
         gst::init().unwrap();
